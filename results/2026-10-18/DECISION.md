@@ -106,6 +106,15 @@ on Qwen3.5-9B, 300 replies each, 0 errors (`results/2026-10-18-name-first/`):
 | mistral.rs + grammar, thinking off | 84.0 % | 72.0 % | 87.0 % / 37.0 % |
 | llama-server native (unchanged run) | 97.6 % | 87.7 % | |
 
+**Uncertainty.** 95 % bootstrap intervals (scenarios resampled, from
+`results/2026-10-18-name-first/report.md`) for the three headline
+correct-choice rates: llama-server native 87.7 % [80.7–94.0], llama-server +
+name-first grammar (thinking on) 76.7 % [67.0–86.3], mistral.rs + name-first
+grammar 72.0 % [62.0–81.7]. The paired difference native − name-first grammar
+(llama-server, thinking on) over the 60 shared scenarios is +11.0 pts
+[1.7–20.7]. Its lower bound is above 0, so the native lead is outside the
+noise, though only just.
+
 - **Key order explained much of the gap.** Correct choice rose by 24 points on
   llama-server and by 35 points on mistral.rs.
 - **The grammar is still behind native tool calling**, by about 11 points of
@@ -116,9 +125,11 @@ on Qwen3.5-9B, 300 replies each, 0 errors (`results/2026-10-18-name-first/`):
 - **pa is still much weaker than coder in grammar mode:** 85 to 88 of 150
   correct on pa, against 129 to 142 of 150 on coder.
 - **Thinking on or off made little difference** with the name-first grammar
-  (76.7 % against 74.7 % on llama-server). mistral.rs with matching settings is
-  slightly behind llama-server, so the engine comparison is no longer
-  confounded.
+  (76.7 % against 74.7 % on llama-server). mistral.rs (72.0 % [62.0–81.7])
+  and llama-server (76.7 % [67.0–86.3]) are within noise of each other
+  (paired over 60 shared scenarios, llama-server − mistral.rs +4.7 pts
+  [−1.3–10.7]); the engine comparison is no longer confounded by thinking,
+  but it shows no difference.
 
 **The decision stands.** We don't build aivyx-engine for tool calls. pa keeps
 `constrain_tool_calls` off, because native tool calling remains the better
