@@ -93,7 +93,7 @@ impl Stats {
 /// Keyed `"<endpoint>/<model>"`. The valid-call denominator is every reply
 /// that made a call, should have made one, or could not be parsed. Transport
 /// failures (`error` set: HTTP error or timeout) are excluded from the
-/// valid-call rate but still count as replies, errors and wrong choices.
+/// valid-call rate, latency and token totals but still count as replies, errors and wrong choices.
 /// A `grammar_unsupported` status only applies to an endpoint with no replies.
 pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
     let mut out: BTreeMap<String, Stats> = BTreeMap::new();
@@ -137,10 +137,12 @@ pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
                         && matches!(r.reply, Reply::ToolCall { .. })
                         && !r.checks.real_name,
                 );
-                st.latencies_ms.push(r.latency_ms);
-                if let Some(t) = r.completion_tokens {
-                    st.tokens += t;
-                    st.token_ms += r.latency_ms;
+                if r.error.is_none() {
+                    st.latencies_ms.push(r.latency_ms);
+                    if let Some(t) = r.completion_tokens {
+                        st.tokens += t;
+                        st.token_ms += r.latency_ms;
+                    }
                 }
                 let cat = st.by_category.entry(r.category).or_default();
                 cat.0 += usize::from(r.checks.right_choice);
@@ -225,16 +227,30 @@ pub fn verdict(stats: &BTreeMap<String, Stats>, cfg: &VerdictConfig) -> Verdict 
                     cfg.challenger
                 ));
             }
-            Some(ch) if ch.grammar_unsupported || ch.replies == 0 => {
+            Some(ch) if ch.grammar_unsupported => {
                 return Verdict::Undecided(format!(
                     "challenger `{}` rejected the grammar request; condition 2 is untested ({note})",
                     cfg.challenger
                 ));
             }
+            Some(ch) if ch.replies == 0 => {
+                return Verdict::Undecided(format!(
+                    "challenger `{}` was not measured; condition 2 is untested ({note})",
+                    cfg.challenger
+                ));
+            }
+            Some(ch) if ch.valid_rate().is_none() => {
+                return Verdict::Undecided(format!(
+                    "challenger `{}` produced no scorable replies (all {} failed: transport errors); condition 2 is untested ({note})",
+                    cfg.challenger, ch.errors
+                ));
+            }
             _ => {}
         }
     }
-    if let Some(ch) = get(&cfg.challenger).filter(|c| !c.grammar_unsupported && c.replies > 0) {
+    if let Some(ch) = get(&cfg.challenger)
+        .filter(|c| !c.grammar_unsupported && c.replies > 0 && c.valid_rate().is_some())
+    {
         let (cv, cc) = (
             ch.valid_rate().unwrap_or(0.0),
             ch.choice_rate().unwrap_or(0.0),
@@ -339,6 +355,9 @@ pub fn render(stats: &BTreeMap<String, Stats>, verdict: Option<&Verdict>) -> Str
         );
     }
     md.push_str("\n## Flaky scenarios\n\n");
+    if stats.values().all(|s| s.flaky.is_empty()) {
+        md.push_str("- none\n");
+    }
     for s in stats.values().filter(|s| !s.flaky.is_empty()) {
         let _ = writeln!(
             md,
@@ -577,6 +596,61 @@ mod tests {
     fn missing_baseline_is_undecided() {
         let s = stats(vec![lines("chal", 10, 10, 1)]);
         assert!(matches!(verdict(&s, &cfg()), Verdict::Undecided(_)));
+    }
+
+    fn all_errors(endpoint: &str, n: usize) -> Vec<Line> {
+        let mut ls = lines(endpoint, n, 0, 30000);
+        for l in ls.iter_mut() {
+            if let Line::Reply(r) = l {
+                r.error = Some("timeout".into());
+                r.reply = Reply::Unparseable { reason: "t".into() };
+                r.checks = no_checks();
+                r.completion_tokens = None;
+            }
+        }
+        ls
+    }
+
+    #[test]
+    fn all_error_challenger_is_undecided() {
+        let mut parts = lines("base", 100, 99, 1000);
+        parts.extend(all_errors("chal", 5));
+        match verdict(&aggregate(&parts), &cfg()) {
+            Verdict::Undecided(r) => {
+                assert!(
+                    r.contains("no scorable replies") && r.contains("clears both bars"),
+                    "{r}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_reply_unsupported_reason_differs() {
+        let mut parts = lines("base", 100, 99, 1000);
+        parts.push(status("chal"));
+        match verdict(&aggregate(&parts), &cfg()) {
+            Verdict::Undecided(r) => assert!(r.contains("rejected the grammar"), "{r}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeouts_do_not_move_latency() {
+        let mut ls = lines("e", 3, 3, 100);
+        ls.extend(all_errors("e", 2));
+        let s = aggregate(&ls);
+        let e = &s["e/m"];
+        assert_eq!((e.replies, e.errors), (5, 2));
+        assert_eq!((e.median_ms(), e.p95_ms()), (Some(100), Some(100)));
+        assert_eq!(e.tokens_per_sec(), Some(100.0));
+    }
+
+    #[test]
+    fn render_says_none_when_nothing_is_flaky() {
+        let s = aggregate(&lines("base", 10, 10, 5));
+        assert!(render(&s, None).ends_with("## Flaky scenarios\n\n- none\n"));
     }
 
     #[test]
