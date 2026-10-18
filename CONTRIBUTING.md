@@ -46,8 +46,8 @@ covers this).
 - For anything beyond a small fix, please open an issue first to describe
   the shape of the change so we can agree on the approach.
 - Keep changes focused — a PR should do one thing.
-- Keep everything outside `src/discovery/` free of I/O and `async` —
-  `select()` must stay a pure, deterministic function.
+- Keep `aivyx-stencil` free of I/O and `async`: its output must stay
+  byte-identical to what aivyx-pa relied on when it was extracted.
 
 ## Building & testing
 
