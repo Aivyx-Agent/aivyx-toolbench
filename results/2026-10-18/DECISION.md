@@ -113,7 +113,9 @@ name-first grammar (thinking on) 76.7 % [67.0–86.3], mistral.rs + name-first
 grammar 72.0 % [62.0–81.7]. The paired difference native − name-first grammar
 (llama-server, thinking on) over the 60 shared scenarios is +11.0 pts
 [1.7–20.7]. Its lower bound is above 0, so the native lead is outside the
-noise, though only just.
+noise, though only just: it is a real lead. But that lower bound is below
+toolbench's 5-point edge, so by toolbench's own rule the lead is *within noise*
+as an edge.
 
 - **Key order explained much of the gap.** Correct choice rose by 24 points on
   llama-server and by 35 points on mistral.rs.
