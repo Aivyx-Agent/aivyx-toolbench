@@ -12,6 +12,14 @@ mode = "grammar"
 grammar_field = "json_schema"
 
 [[endpoint]]
+name = "llama-grammar-nothink"
+base_url = "http://127.0.0.1:8090/v1"
+model = "/models/Qwen3.5-9B-Q4_K_M.gguf"
+mode = "grammar"
+grammar_field = "json_schema"
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[[endpoint]]
 name = "mistralrs-grammar"
 base_url = "http://127.0.0.1:1234/v1"
 model = "default"

@@ -11,11 +11,11 @@ aivyx-pa by git rev) and `crates/toolbench` (benchmark CLI).
 
 ## Rules
 
-- `aivyx-stencil` output must stay byte-identical to what aivyx-pa relied on
-  when it was extracted, for tool schemas without local `$defs`/`definitions`
-  (those are hoisted into the grammar root since b848525); pa's frozen golden
-  test is the second check. No I/O, no async, dependencies serde + serde_json
-  only.
+- `aivyx-stencil` output is no longer byte-identical to the extraction from
+  aivyx-pa: since e939e61 the grammar's input key is `parameters` (so `name`
+  comes first), and since b848525 local `$defs`/`definitions` are hoisted into
+  the grammar root. aivyx-pa's frozen golden test is updated when pa bumps its
+  pin. No I/O, no async, dependencies serde + serde_json only.
 - `results/2026-10-18/DECISION.md` records why aivyx-engine was not built
   despite the mechanical verdict: read it before re-running the comparison.
 - toolbench never executes a tool; it only scores replies.
