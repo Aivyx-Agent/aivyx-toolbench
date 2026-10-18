@@ -49,6 +49,9 @@ pub fn build_body(ep: &Endpoint, snap: &Snapshot, sc: &Scenario) -> Value {
             }
         }
     }
+    if let Some(t) = ep.temperature {
+        body["temperature"] = json!(t);
+    }
     for (k, v) in &ep.extra_body {
         body[k] = v.clone();
     }
@@ -92,6 +95,7 @@ mod tests {
             grammar_field,
             max_tokens: 256,
             extra_body: Default::default(),
+            temperature: None,
         }
     }
 
@@ -100,6 +104,7 @@ mod tests {
             product: "pa".into(),
             source: "t".into(),
             system_prompt: Some("You are Aivyx.".into()),
+            file_sha256: String::new(),
             tools: vec![ToolSpec {
                 name: "fs.read".into(),
                 description: "Read a file".into(),
@@ -121,6 +126,16 @@ messages = [
 [expect]
 kind = "respond"
 "#).unwrap()
+    }
+
+    #[test]
+    fn temperature_is_sent_only_when_set() {
+        let mut e = ep(Mode::Native, GrammarField::JsonSchema);
+        let body = build_body(&e, &snap(), &scenario());
+        assert!(body.get("temperature").is_none());
+        e.temperature = Some(0.6);
+        let body = build_body(&e, &snap(), &scenario());
+        assert_eq!(body["temperature"], json!(0.6));
     }
 
     #[test]

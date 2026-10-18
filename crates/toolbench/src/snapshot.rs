@@ -17,14 +17,18 @@ pub struct Snapshot {
     /// The product's real system prompt, sent with every scenario.
     pub system_prompt: Option<String>,
     pub tools: Vec<ToolSpec>,
+    /// sha256 of the file this snapshot was loaded from (not serialized).
+    #[serde(skip)]
+    pub file_sha256: String,
 }
 
 impl Snapshot {
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let snap: Snapshot =
+        let mut snap: Snapshot =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        snap.file_sha256 = crate::util::sha256_hex(text.as_bytes());
         snap.validate()
             .with_context(|| format!("validating {}", path.display()))?;
         Ok(snap)
@@ -98,6 +102,7 @@ mod tests {
             product: "pa".into(),
             source: "test".into(),
             system_prompt: None,
+            file_sha256: String::new(),
             tools,
         }
     }

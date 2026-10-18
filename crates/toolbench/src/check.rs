@@ -85,6 +85,7 @@ mod tests {
             product: "pa".into(),
             source: "t".into(),
             system_prompt: None,
+            file_sha256: String::new(),
             tools: vec![ToolSpec {
                 name: "fs.read".into(),
                 description: "d".into(),

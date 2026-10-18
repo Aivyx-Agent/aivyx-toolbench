@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
         } => {
             let snaps = snapshot::load_dir(&snapshots)?;
             let scs = scenario::load_dir(&scenarios, &snaps)?;
-            let lines = runner::rescore(&result::read_lines(&input)?, &scs, &snaps)?;
+            let lines = runner::rescore(&result::read_lines_tagged(&input)?, &scs, &snaps)?;
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
             let cfg = config::Config::load(&config)?;
             let mut lines = Vec::new();
             for path in &inputs {
-                lines.extend(result::read_lines(path)?);
+                lines.extend(result::read_lines_tagged(path)?);
             }
             let stats = report::aggregate(&lines);
             let verdict = cfg.verdict.as_ref().map(|v| report::verdict(&stats, v));

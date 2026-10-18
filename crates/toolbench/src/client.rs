@@ -81,14 +81,23 @@ pub async fn post(
     }
 }
 
-/// `GET {base}/models` within 5 s: is anything listening?
-pub async fn reachable(client: &reqwest::Client, ep: &Endpoint) -> Result<()> {
-    client
+/// `GET {base}/models` within 5 s: is anything listening? Returns the model
+/// ids it lists (empty if it lists none).
+pub async fn reachable(client: &reqwest::Client, ep: &Endpoint) -> Result<Vec<String>> {
+    let resp = client
         .get(ep.models_url())
         .timeout(Duration::from_secs(5))
         .send()
         .await
         .and_then(|r| r.error_for_status())
         .with_context(|| format!("endpoint `{}` at {} is unreachable", ep.name, ep.base_url))?;
-    Ok(())
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    Ok(body["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
 }

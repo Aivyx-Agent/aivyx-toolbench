@@ -109,6 +109,7 @@ pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
                     saw_status.push(key);
                 }
             }
+            Line::Run(_) | Line::RunEnd(_) => {}
             Line::Reply(r) => {
                 let key = format!("{}/{}", r.endpoint, r.model);
                 let st = out
@@ -409,6 +410,7 @@ mod tests {
             .map(|i| {
                 let ok = i < good;
                 Line::Reply(ReplyLine {
+                    run_id: None,
                     endpoint: endpoint.into(),
                     model: "m".into(),
                     mode: Mode::Grammar,
@@ -528,6 +530,7 @@ mod tests {
 
     fn status(endpoint: &str) -> Line {
         Line::EndpointStatus(StatusLine {
+            run_id: None,
             endpoint: endpoint.into(),
             model: "m".into(),
             mode: Mode::Grammar,

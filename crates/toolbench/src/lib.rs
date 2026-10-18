@@ -11,6 +11,7 @@ pub mod result;
 pub mod runner;
 pub mod scenario;
 pub mod snapshot;
+pub mod util;
 
 #[cfg(test)]
 mod fake;

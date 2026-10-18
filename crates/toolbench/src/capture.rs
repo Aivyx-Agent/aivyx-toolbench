@@ -60,6 +60,7 @@ pub fn snapshot_from_request(body: &Value, product: &str, source: &str) -> Resul
         product: product.into(),
         source: source.into(),
         system_prompt,
+        file_sha256: String::new(),
         tools,
     };
     snap.validate()?;
