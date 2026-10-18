@@ -71,6 +71,15 @@ enum Command {
         source: String,
         #[arg(long)]
         out: PathBuf,
+        /// Save without asking (after reviewing the printed summary).
+        #[arg(long)]
+        accept: bool,
+        /// Skip redaction of home paths, user name, emails and IPs.
+        #[arg(long)]
+        no_redact: bool,
+        /// Allow a non-loopback --listen address.
+        #[arg(long)]
+        allow_remote: bool,
     },
 }
 
@@ -208,8 +217,16 @@ async fn main() -> Result<()> {
             product,
             source,
             out,
+            accept,
+            no_redact,
+            allow_remote,
         } => {
-            toolbench::capture::serve(listen, product, source, out).await?;
+            toolbench::capture::check_listen(listen, allow_remote)?;
+            let opts = toolbench::capture::CaptureOptions {
+                accept,
+                redact: !no_redact,
+            };
+            toolbench::capture::serve(listen, product, source, out, opts).await?;
         }
     }
     Ok(())
