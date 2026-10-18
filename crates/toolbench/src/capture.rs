@@ -75,7 +75,7 @@ pub struct Redactor {
     skipped_user: Option<String>,
 }
 
-const GENERIC_NAMES: [&str; 4] = ["user", "root", "home", "example"];
+const GENERIC_NAMES: [&str; 5] = ["user", "root", "home", "example", "com"];
 
 impl Redactor {
     pub fn from_env() -> Self {
@@ -87,18 +87,22 @@ impl Redactor {
             }
             homes.push(h.clone());
         }
-        let user = std::env::var("USER")
+        let candidates = std::env::var("USER")
             .ok()
-            .or_else(|| std::env::var("LOGNAME").ok())
-            .or_else(|| {
+            .into_iter()
+            .chain(std::env::var("LOGNAME").ok())
+            .chain(
                 home.as_deref()
                     .and_then(|h| h.trim_end_matches('/').rsplit('/').next())
-                    .map(str::to_string)
-            });
-        Self::new(homes, user)
+                    .map(str::to_string),
+            )
+            .collect();
+        Self::new(homes, candidates)
     }
 
-    fn new(homes: Vec<String>, user: Option<String>) -> Self {
+    /// `candidates` are tried in order; the first non-generic one is used.
+    /// If all are generic, the first is remembered for a review warning.
+    fn new(homes: Vec<String>, candidates: Vec<String>) -> Self {
         let mut home: Vec<String> = Vec::new();
         for h in homes {
             let h = h.trim_end_matches('/').to_string();
@@ -108,9 +112,11 @@ impl Redactor {
         }
         let generic =
             |u: &str| u.chars().count() < 3 || GENERIC_NAMES.contains(&u.to_lowercase().as_str());
-        let (user, skipped_user) = match user {
-            Some(u) if generic(&u) => (None, Some(u)),
-            other => (other, None),
+        let user = candidates.iter().find(|u| !generic(u)).cloned();
+        let skipped_user = if user.is_none() {
+            candidates.first().cloned()
+        } else {
+            None
         };
         Self {
             home,
@@ -121,7 +127,7 @@ impl Redactor {
 
     #[cfg(test)]
     fn for_test(home: &str, user: &str) -> Self {
-        Self::new(vec![home.to_string()], Some(user.to_string()))
+        Self::new(vec![home.to_string()], vec![user.to_string()])
     }
 
     /// A review warning when the user name was too generic to redact.
@@ -129,6 +135,17 @@ impl Redactor {
         self.skipped_user
             .as_ref()
             .map(|u| format!("user name `{u}` too short/generic to redact"))
+    }
+
+    /// True when the text contains a home path or the user name
+    /// (case-insensitive substring).
+    fn mentions(&self, text: &str) -> bool {
+        let t = text.to_lowercase();
+        self.home.iter().any(|h| t.contains(&h.to_lowercase()))
+            || self
+                .user
+                .as_ref()
+                .is_some_and(|u| t.contains(&u.to_lowercase()))
     }
 
     /// Replaces private details; returns the text and counts per kind.
@@ -148,9 +165,18 @@ impl Redactor {
         };
         for h in &self.home {
             // The path must end at a boundary: `/home/al` is not `/home/alice`.
-            let re =
-                regex::Regex::new(&format!(r"{}([^A-Za-z0-9_.-]|$)", regex::escape(h))).unwrap();
-            replace(&mut counts, &mut s, &re, "/home/user${1}", "home path");
+            let re = regex::Regex::new(&format!(
+                r"{}(?:([^A-Za-z0-9_.-]|$)|([.-])([^A-Za-z0-9_]|$))",
+                regex::escape(h)
+            ))
+            .unwrap();
+            replace(
+                &mut counts,
+                &mut s,
+                &re,
+                "/home/user${1}${2}${3}",
+                "home path",
+            );
         }
         let url_user = regex::Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/?#\s@]+@").unwrap();
         replace(&mut counts, &mut s, &url_user, "$1", "url credentials");
@@ -241,6 +267,19 @@ fn redact_value(
     }
 }
 
+fn object_keys<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| object_keys(x, out)),
+        Value::Object(o) => {
+            for (k, x) in o {
+                out.push(k);
+                object_keys(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn string_leaves<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
     match v {
         Value::String(s) => out.push(s),
@@ -285,12 +324,23 @@ fn redacted_snapshot(
 
 /// Review lines for everything worth a human look in the (redacted)
 /// snapshot: prompt, tool names, descriptions and schema string leaves.
-fn review_flags(snap: &Snapshot) -> Vec<String> {
+fn review_flags(snap: &Snapshot, r: &Redactor) -> Vec<String> {
     let mut out = Vec::new();
     for (n, c) in flags(snap.system_prompt.as_deref().unwrap_or("")) {
         out.push(format!("system prompt line {n}: {c}"));
     }
     for t in &snap.tools {
+        if r.mentions(&t.name) {
+            out.push(format!("tool name mentions a private detail: {}", t.name));
+        }
+        let mut keys = Vec::new();
+        object_keys(&t.input_schema, &mut keys);
+        for k in keys.into_iter().filter(|k| r.mentions(k)) {
+            out.push(format!(
+                "{} schema key mentions a private detail: {k}",
+                t.name
+            ));
+        }
         for (n, c) in flags(&t.name) {
             out.push(format!("tool name line {n}: {c}"));
         }
@@ -346,8 +396,8 @@ struct Shared {
 
 /// Prints the review, decides, and saves or declines one snapshot.
 async fn review(s: Shared, snap: Snapshot) {
+    let r = Redactor::from_env();
     let snap = if s.opts.redact {
-        let r = Redactor::from_env();
         let (snap, counts) = redacted_snapshot(snap, &r);
         let parts: Vec<String> = counts
             .iter()
@@ -375,7 +425,7 @@ async fn review(s: Shared, snap: Snapshot) {
         snap.tools.len(),
         snap.system_prompt.as_deref().unwrap_or("").chars().count()
     );
-    for f in review_flags(&snap) {
+    for f in review_flags(&snap, &r) {
         eprintln!("capture: review: flagged {f}");
     }
     let save = if s.opts.accept {
@@ -706,7 +756,7 @@ mod tests {
         snap.tools[0].input_schema["properties"]["path"]["description"] =
             json!("## Learned skills");
         snap.tools[1].name = "t".repeat(40);
-        let f = review_flags(&snap);
+        let f = review_flags(&snap, &Redactor::for_test("/h/none", "xyz1"));
         assert!(f.iter().any(|l| l.contains("Learned")), "{f:?}");
         assert!(f.iter().any(|l| l.contains(&"t".repeat(40))), "{f:?}");
     }
@@ -719,6 +769,49 @@ mod tests {
         assert_eq!(
             r.redact("/home/al/x and /home/al").0,
             "/home/user/x and /home/user"
+        );
+    }
+
+    #[test]
+    fn home_followed_by_sentence_punctuation_is_redacted() {
+        let r = Redactor::new(
+            vec!["/home/fakeal".into()],
+            vec!["root".into(), "fakeal".into()],
+        );
+        assert_eq!(r.redact("Home is /home/fakeal.").0, "Home is /home/user.");
+        assert_eq!(r.redact("see /home/fakeal- ok").0, "see /home/user- ok");
+        // A different directory: only the user-name step touches it.
+        assert_eq!(r.redact("/home/fakeal-old/x").0, "/home/user-old/x");
+        assert_eq!(r.redact("/home/fakeal.txt").0, "/home/user.txt");
+        assert!(r.warning().is_none());
+    }
+
+    #[test]
+    fn generic_env_user_falls_back_to_the_home_dir_name() {
+        let r = Redactor::new(
+            vec!["/home/fakeal".into()],
+            vec!["ab".into(), "fakeal".into()],
+        );
+        assert_eq!(r.redact("fakeal wrote").0, "user wrote");
+        let r = Redactor::new(vec!["/home/x".into()], vec!["root".into(), "com".into()]);
+        assert!(r.warning().unwrap().contains("`root`"));
+        assert_eq!(r.redact("a com b").0, "a com b");
+    }
+
+    #[test]
+    fn names_and_schema_keys_mentioning_private_details_are_flagged() {
+        let r = Redactor::for_test("/home/alice", "alice");
+        let mut snap = schema_snapshot();
+        snap.tools[0].name = "read_Alice_notes".into();
+        snap.tools[1].input_schema =
+            json!({"type": "object", "properties": {"/home/alice/key": {"type": "string"}}});
+        let f = review_flags(&snap, &r);
+        assert!(f.iter().any(|l| l.contains("read_Alice_notes")), "{f:?}");
+        assert!(f.iter().any(|l| l.contains("/home/alice/key")), "{f:?}");
+        assert!(
+            review_flags(&schema_snapshot(), &r)
+                .iter()
+                .all(|l| !l.contains("schema key"))
         );
     }
 
