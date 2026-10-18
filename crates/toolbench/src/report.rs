@@ -333,21 +333,33 @@ fn many_runs(n: usize, name: &str) -> String {
     format!("{n} runs of `{name}`; choose one with --run {name}=<run_id> or --latest")
 }
 
-/// `+15.3 pts [6.1–24.0]`: the paired point and CI over the shared
-/// scenarios, so the point always lies in its bracket; without a paired CI,
-/// the overall difference `b − a`.
-fn edge_text(a: f64, b: f64, ci: Option<(f64, f64, f64)>) -> String {
+/// The overall difference `b − a` in points, then the paired CI over the
+/// shared scenarios: `+15.3 pts [6.1–24.0]` when the paired point equals the
+/// overall one (within 0.05), else
+/// `+15.3 pts overall; paired over 50 shared scenarios +17.5 pts [8.6–27.7]`,
+/// so the printed point always lies in its bracket and matches the table.
+fn edge_text(
+    a: f64,
+    b: f64,
+    ci: Option<(f64, f64, f64)>,
+    a_map: &BTreeMap<String, (usize, usize)>,
+    b_map: &BTreeMap<String, (usize, usize)>,
+) -> String {
+    let overall = ((b * 1000.0).round() - (a * 1000.0).round()) / 10.0;
     match ci {
-        Some((p, lo, hi)) => format!(
-            "{:+.1} pts [{:.1}–{:.1}]",
-            p * 100.0,
-            lo * 100.0,
-            hi * 100.0
-        ),
-        None => format!(
-            "{:+.1} pts",
-            ((b * 1000.0).round() - (a * 1000.0).round()) / 10.0
-        ),
+        Some((p, lo, hi)) if ((b - a) * 100.0 - p * 100.0).abs() < 0.05 => {
+            format!("{overall:+.1} pts [{:.1}–{:.1}]", lo * 100.0, hi * 100.0)
+        }
+        Some((p, lo, hi)) => {
+            let shared = a_map.keys().filter(|k| b_map.contains_key(*k)).count();
+            format!(
+                "{overall:+.1} pts overall; paired over {shared} shared scenarios {:+.1} pts [{:.1}–{:.1}]",
+                p * 100.0,
+                lo * 100.0,
+                hi * 100.0
+            )
+        }
+        None => format!("{overall:+.1} pts"),
     }
 }
 
@@ -547,9 +559,25 @@ fn decide(
         if edge && comparable {
             let mut beats = Vec::new();
             let mut others = Vec::new();
-            for (fires, label, a, b, ci) in [
-                (v_edge, "valid call", bv, cv, pv),
-                (c_edge, "correct choice", bc, cc, pc),
+            for (fires, label, a, b, ci, am, bm) in [
+                (
+                    v_edge,
+                    "valid call",
+                    bv,
+                    cv,
+                    pv,
+                    &base.scen_valid,
+                    &ch.scen_valid,
+                ),
+                (
+                    c_edge,
+                    "correct choice",
+                    bc,
+                    cc,
+                    pc,
+                    &base.scen_choice,
+                    &ch.scen_choice,
+                ),
             ] {
                 if fires {
                     let clearly = edge_clearly(ci);
@@ -558,7 +586,7 @@ fn decide(
                     }
                     beats.push(format!(
                         "on {label} by {} ({})",
-                        edge_text(a, b, ci),
+                        edge_text(a, b, ci, am, bm),
                         noise(clearly)
                     ));
                 } else {
@@ -589,8 +617,8 @@ fn decide(
             keep.push(format!(
                 "{} has no 5-point edge (valid call {}, correct choice {}), {}",
                 cfg.challenger,
-                edge_text(bv, cv, pv),
-                edge_text(bc, cc, pc),
+                edge_text(bv, cv, pv, &base.scen_valid, &ch.scen_valid),
+                edge_text(bc, cc, pc, &base.scen_choice, &ch.scen_choice),
                 noise(clearly)
             ));
         }
@@ -1330,7 +1358,9 @@ mod tests {
         match &a.verdict {
             Verdict::Build(r) => assert!(
                 r.iter()
-                    .any(|x| x.contains("on correct choice by +10.0 pts [10.0–10.0] (clearly)")),
+                    .any(|x| x.contains(
+                        "on correct choice by +7.6 pts overall; paired over 40 shared scenarios +10.0 pts [10.0–10.0] (clearly)"
+                    )),
                 "{r:?}"
             ),
             other => panic!("{other:?}"),
