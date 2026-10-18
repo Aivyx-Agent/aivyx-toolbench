@@ -91,3 +91,37 @@ Follow-ups, in order:
 
 The engine's other goals (zero-setup local models, shared scheduling, process
 isolation) were not measured here and remain open.
+
+## Addendum: name-first grammar re-measured (same day)
+
+Follow-up 1 is done. Since `e939e61` the grammar's input key is `parameters`,
+which sorts after `name`, so the model commits to a tool before writing its
+input. 267 to 284 of 300 grammar replies now start with `{"name"`. Re-measured
+on Qwen3.5-9B, 300 replies each, 0 errors (`results/2026-10-18-name-first/`):
+
+| setup | valid call | correct choice | before (`arguments` first) |
+|---|---|---|---|
+| llama-server + grammar, thinking on | 82.4 % | 76.7 % | 71.7 % / 52.7 % |
+| llama-server + grammar, thinking off | 80.4 % | 74.7 % | (not run) |
+| mistral.rs + grammar, thinking off | 84.0 % | 72.0 % | 87.0 % / 37.0 % |
+| llama-server native (unchanged run) | 97.6 % | 87.7 % | |
+
+- **Key order explained much of the gap.** Correct choice rose by 24 points on
+  llama-server and by 35 points on mistral.rs.
+- **The grammar is still behind native tool calling**, by about 11 points of
+  correct choice and 15 of valid call.
+  - Most of the remaining misses are plain-text `respond` replies where a call
+    was expected: 35 to 45 of 235, against 6 for native.
+  - Wrong-tool replies come next: 26 to 44, against 18 for native.
+- **pa is still much weaker than coder in grammar mode:** 85 to 88 of 150
+  correct on pa, against 129 to 142 of 150 on coder.
+- **Thinking on or off made little difference** with the name-first grammar
+  (76.7 % against 74.7 % on llama-server). mistral.rs with matching settings is
+  slightly behind llama-server, so the engine comparison is no longer
+  confounded.
+
+**The decision stands.** We don't build aivyx-engine for tool calls. pa keeps
+`constrain_tool_calls` off, because native tool calling remains the better
+default. If the grammar is worth pursuing further, the next things to try are:
+- a weaker text escape, or none in turns that must call a tool;
+- a lazy grammar that applies only once a call starts.
