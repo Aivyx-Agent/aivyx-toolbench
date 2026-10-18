@@ -103,10 +103,14 @@ async fn main() -> Result<()> {
             timeout,
             out,
         } => {
+            anyhow::ensure!(repeat > 0, "--repeat must be at least 1");
             let cfg = config::Config::load(&config)?;
             let ep = cfg.endpoint(&endpoint)?;
             let snaps = snapshot::load_dir(&snapshots)?;
             let scs = scenario::load_dir(&scenarios, &snaps)?;
+            // Check reachability before touching `--out`, so an unreachable
+            // endpoint never truncates or replaces earlier results.
+            toolbench::client::reachable(&reqwest::Client::new(), ep).await?;
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -139,6 +143,9 @@ async fn main() -> Result<()> {
             let snaps = snapshot::load_dir(&snapshots)?;
             let scs = scenario::load_dir(&scenarios, &snaps)?;
             let lines = runner::rescore(&result::read_lines(&input)?, &scs, &snaps)?;
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             let mut file = std::fs::File::create(&out)?;
             for line in &lines {
                 result::write_line(&mut file, line)?;
