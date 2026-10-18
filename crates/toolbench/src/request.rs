@@ -49,6 +49,9 @@ pub fn build_body(ep: &Endpoint, snap: &Snapshot, sc: &Scenario) -> Value {
             }
         }
     }
+    for (k, v) in &ep.extra_body {
+        body[k] = v.clone();
+    }
     body
 }
 
@@ -88,6 +91,7 @@ mod tests {
             mode,
             grammar_field,
             max_tokens: 256,
+            extra_body: Default::default(),
         }
     }
 
@@ -183,5 +187,15 @@ kind = "respond"
             body["response_format"]["json_schema"]["schema"],
             aivyx_stencil::tool_call_grammar(&snap().tools)
         );
+    }
+
+    #[test]
+    fn extra_body_fields_are_merged_into_the_request() {
+        let mut e = ep(Mode::Grammar, GrammarField::ResponseFormat);
+        e.extra_body
+            .insert("enable_thinking".into(), json!(false));
+        let body = build_body(&e, &snap(), &scenario());
+        assert_eq!(body["enable_thinking"], json!(false));
+        assert_eq!(body["model"], json!("m"));
     }
 }

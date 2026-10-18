@@ -184,6 +184,7 @@ tool = "fs.read"
             mode,
             grammar_field: GrammarField::JsonSchema,
             max_tokens: 64,
+            extra_body: Default::default(),
         }
     }
 

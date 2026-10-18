@@ -37,6 +37,9 @@ pub struct Endpoint {
     pub grammar_field: GrammarField,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Extra top-level request fields (e.g. `enable_thinking = false`).
+    #[serde(default)]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_max_tokens() -> u32 {

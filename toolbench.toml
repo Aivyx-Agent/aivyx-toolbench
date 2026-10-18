@@ -17,6 +17,14 @@ base_url = "http://127.0.0.1:1234/v1"
 model = "default"
 mode = "grammar"
 grammar_field = "response_format"
+extra_body = { enable_thinking = false }
+
+[[endpoint]]
+name = "mistralrs-grammar-think"
+base_url = "http://127.0.0.1:1234/v1"
+model = "default"
+mode = "grammar"
+grammar_field = "response_format"
 
 [[endpoint]]
 name = "ollama-native"
