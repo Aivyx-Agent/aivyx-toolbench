@@ -261,12 +261,36 @@ pub fn verdict(stats: &BTreeMap<String, Stats>, cfg: &VerdictConfig) -> Verdict 
             _ => false,
         };
         if edge && comparable {
+            let mut beats = Vec::new();
+            let mut others = Vec::new();
+            if cv - bv >= EDGE - 1e-9 {
+                beats.push(format!(
+                    "on valid call by {:.1} points ({} vs {})",
+                    ((cv * 1000.0).round() - (bv * 1000.0).round()) / 10.0,
+                    pct(cv),
+                    pct(bv)
+                ));
+            }
+            if cc - bc >= EDGE - 1e-9 {
+                beats.push(format!(
+                    "on correct choice by {:.1} points ({} vs {})",
+                    ((cc * 1000.0).round() - (bc * 1000.0).round()) / 10.0,
+                    pct(cc),
+                    pct(bc)
+                ));
+            }
+            if cv - bv < EDGE - 1e-9 {
+                others.push(format!("valid call {} vs {}", pct(cv), pct(bv)));
+            }
+            if cc - bc < EDGE - 1e-9 {
+                others.push(format!("correct choice {} vs {}", pct(cc), pct(bc)));
+            }
             build.push(format!(
-                "{} beats {} by ≥ 5 points ({} / {}) at comparable speed",
+                "{} beats {} {} at comparable median speed; {}",
                 cfg.challenger,
                 cfg.baseline,
-                pct(cv),
-                pct(cc)
+                beats.join(" and "),
+                others.join(", ")
             ));
         } else if edge {
             keep.push(format!(
@@ -486,6 +510,15 @@ mod tests {
             matches!(verdict(&big, &cfg()), Verdict::Build(_)),
             "10-point choice edge within 20 %"
         );
+        match verdict(&big, &cfg()) {
+            Verdict::Build(r) => assert!(
+                r.iter()
+                    .any(|x| x.contains("on correct choice by 10.0 points")
+                        && !x.contains("on valid call")),
+                "{r:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
         let slow = stats(vec![base, lines("chal", 100, 100, 1300)]);
         assert!(
             matches!(verdict(&slow, &cfg()), Verdict::DontBuild(_)),

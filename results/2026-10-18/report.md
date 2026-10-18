@@ -4,7 +4,7 @@
 
 - llama-grammar valid-call rate 71.7 % is below 98.0 %
 - llama-grammar correct-choice rate 52.7 % is below 90.0 %
-- mistralrs-grammar beats llama-grammar by ≥ 5 points (87.0 % / 37.0 %) at comparable speed
+- mistralrs-grammar beats llama-grammar on valid call by 15.3 points (87.0 % vs 71.7 %) at comparable median speed; correct choice 37.0 % vs 52.7 %
 
 | endpoint | model | mode | replies | errors | valid call | correct choice | args | hallucinated | median ms | p95 ms | tok/s |
 |---|---|---|---|---|---|---|---|---|---|---|---|

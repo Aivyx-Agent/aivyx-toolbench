@@ -85,6 +85,17 @@ pub const RESPOND_SENTINEL: &str = "respond";
 /// generation constraint. With an empty `tools` slice the grammar
 /// still admits the sentinel, so a constrained turn can always
 /// produce *something* well-formed.
+///
+/// Tool schemas may carry local `$defs` (or `definitions`). Their
+/// definitions are hoisted to the grammar root, and `#/$defs/X` refs
+/// are rewritten to point there, so a decoder can resolve them. Only
+/// that shallow form is rewritten: deep refs (`#/$defs/X/...`), root
+/// refs (`#`), `#/properties/...` refs and nested `$defs` inside a
+/// definition are left as they are and may not resolve.
+///
+/// Object keys are emitted in serde_json's order, which is alphabetical
+/// (no `preserve_order`), so `arguments` comes before `name` in each
+/// branch.
 pub fn tool_call_grammar(tools: &[ToolSpec]) -> Value {
     let mut branches: Vec<Value> = Vec::with_capacity(tools.len() + 1);
     let mut hoisted = serde_json::Map::new();

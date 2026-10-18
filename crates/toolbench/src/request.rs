@@ -192,8 +192,7 @@ kind = "respond"
     #[test]
     fn extra_body_fields_are_merged_into_the_request() {
         let mut e = ep(Mode::Grammar, GrammarField::ResponseFormat);
-        e.extra_body
-            .insert("enable_thinking".into(), json!(false));
+        e.extra_body.insert("enable_thinking".into(), json!(false));
         let body = build_body(&e, &snap(), &scenario());
         assert_eq!(body["enable_thinking"], json!(false));
         assert_eq!(body["model"], json!("m"));
