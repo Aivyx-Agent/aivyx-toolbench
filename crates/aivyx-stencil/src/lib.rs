@@ -21,22 +21,22 @@
 //! { "oneOf": [
 //!   { "type": "object",
 //!     "properties": { "name": { "const": "fs.read" },
-//!                     "arguments": { /* fs.read's input_schema verbatim */ } },
-//!     "required": ["name", "arguments"], "additionalProperties": false },
+//!                     "parameters": { /* fs.read's input_schema verbatim */ } },
+//!     "required": ["name", "parameters"], "additionalProperties": false },
 //!   // …one branch per registered tool…
 //!   { "type": "object",                                   // the sentinel
 //!     "properties": { "name": { "const": "respond" },
-//!                     "arguments": { "type": "object",
-//!                                    "properties": { "text": { "type": "string" } },
-//!                                    "required": ["text"] } },
-//!     "required": ["name", "arguments"], "additionalProperties": false }
+//!                     "parameters": { "type": "object",
+//!                                     "properties": { "text": { "type": "string" } },
+//!                                     "required": ["text"] } },
+//!     "required": ["name", "parameters"], "additionalProperties": false }
 //! ] }
 //! ```
 //!
 //! Each `name` is pinned to a `const` drawn from the registry, so
 //! a **hallucinated name can never match**; that branch's
-//! `arguments` is the matching tool's `input_schema` *verbatim*,
-//! so **malformed arguments can never match**. Because every
+//! `parameters` is the matching tool's `input_schema` *verbatim*,
+//! so **malformed parameters can never match**. Because every
 //! branch's `name` const is distinct, an instance satisfies at
 //! most one branch — `oneOf` (exactly-one) is the correct
 //! combinator, and an unknown name or bad args satisfies *zero*
@@ -47,7 +47,7 @@
 //! A constrained decoder is *forced* into the grammar, so without
 //! an escape the model could never reply in plain text. The
 //! reserved [`RESPOND_SENTINEL`] branch is that escape: the
-//! provider (ST.3) unwraps a `{"name":"respond","arguments":{"text":…}}`
+//! provider (ST.3) unwraps a `{"name":"respond","parameters":{"text":…}}`
 //! "call" back into an ordinary assistant text message rather than
 //! dispatching it. The sentinel name has **no dot**, while every
 //! real Aivyx tool is `namespace.action` — so it can never collide
@@ -94,8 +94,11 @@ pub const RESPOND_SENTINEL: &str = "respond";
 /// definition are left as they are and may not resolve.
 ///
 /// Object keys are emitted in serde_json's order, which is alphabetical
-/// (no `preserve_order`), so `arguments` comes before `name` in each
-/// branch.
+/// (no `preserve_order`), and decoders enforce that property order. The
+/// tool input key is therefore named `parameters`, not `arguments`: it
+/// sorts after `name`, so the model commits to a tool before writing its
+/// input (with `arguments` it wrote the input first, then a name forced
+/// to fit it).
 pub fn tool_call_grammar(tools: &[ToolSpec]) -> Value {
     let mut branches: Vec<Value> = Vec::with_capacity(tools.len() + 1);
     let mut hoisted = serde_json::Map::new();
@@ -191,15 +194,15 @@ fn rewrite_refs(v: &mut Value, renames: &RefRenames) {
     }
 }
 
-/// One union branch: `name` pinned to `name`, `arguments` set to
+/// One union branch: `name` pinned to `name`, `parameters` set to
 /// the tool's input schema verbatim.
 fn tool_branch(name: &str, input_schema: &Value) -> Value {
     // Tools' input schemas are objects at the top level (the
     // registry validates this at registration). If a schema ever
-    // isn't an object it can't be a meaningful `arguments`
+    // isn't an object it can't be a meaningful `parameters`
     // constraint, so fall back to a permissive object — still
     // pinning the *name*, which is the load-bearing guarantee.
-    let arguments = if input_schema.is_object() {
+    let parameters = if input_schema.is_object() {
         input_schema.clone()
     } else {
         json!({ "type": "object" })
@@ -208,9 +211,9 @@ fn tool_branch(name: &str, input_schema: &Value) -> Value {
         "type": "object",
         "properties": {
             "name": { "const": name },
-            "arguments": arguments,
+            "parameters": parameters,
         },
-        "required": ["name", "arguments"],
+        "required": ["name", "parameters"],
         "additionalProperties": false,
     })
 }
@@ -221,14 +224,14 @@ fn respond_branch() -> Value {
         "type": "object",
         "properties": {
             "name": { "const": RESPOND_SENTINEL },
-            "arguments": {
+            "parameters": {
                 "type": "object",
                 "properties": { "text": { "type": "string" } },
                 "required": ["text"],
                 "additionalProperties": false,
             },
         },
-        "required": ["name", "arguments"],
+        "required": ["name", "parameters"],
         "additionalProperties": false,
     })
 }
@@ -239,7 +242,7 @@ fn respond_branch() -> Value {
 // Shared by every provider that grammar-constrains tool calls (the
 // in-process mistral.rs engine and llama.cpp's server). Both constrain
 // output to the [`tool_call_grammar`] shape, so the model emits the
-// same `{"name", "arguments"}` JSON in the message `content` — and both
+// same `{"name", "parameters"}` JSON in the message `content` — and both
 // parse it the same way. These lived in the mistral.rs provider through
 // Stencil/Bridle; Emboss promotes them here so there is one
 // implementation, no drift.
@@ -253,8 +256,8 @@ fn respond_branch() -> Value {
 /// missing instruction.
 pub const RESPOND_PREAMBLE: &str = "\
 Tool-calling mode: every reply must be a single JSON object. To use a tool, emit \
-{\"name\":\"<tool>\",\"arguments\":{…}}. To answer the user in plain text — or when \
-you are done and need no tool — emit {\"name\":\"respond\",\"arguments\":{\"text\":\"…\"}}; \
+{\"name\":\"<tool>\",\"parameters\":{…}}. To answer the user in plain text — or when \
+you are done and need no tool — emit {\"name\":\"respond\",\"parameters\":{\"text\":\"…\"}}; \
 this ends your turn. Do not repeat the same tool call: if a call did not help, either \
 try a different one or `respond`.";
 
@@ -273,7 +276,7 @@ pub fn system_message_for(base: Option<&str>, constrain: bool) -> Option<String>
 
 /// Outcome of parsing a grammar-constrained turn's output (Chapter
 /// Stencil ST.3). [`tool_call_grammar`] admits a single `{"name",
-/// "arguments"}` object; the `respond` sentinel maps to plain text, any
+/// "parameters"}` object; the `respond` sentinel maps to plain text, any
 /// other name to a real tool call.
 #[derive(Debug, PartialEq)]
 pub enum ConstrainedOutput {
@@ -284,11 +287,17 @@ pub enum ConstrainedOutput {
 /// Parse the JSON a grammar-constrained turn produced. Returns `None`
 /// when `content` isn't the expected shape — the grammar guarantees it
 /// is, so `None` is purely defensive (the caller falls back to the
-/// provider's native extraction).
+/// provider's native extraction). The tool input is read from
+/// `parameters`, falling back to the legacy `arguments` key; `parameters`
+/// wins if both are present.
 pub fn parse_constrained_output(content: &str) -> Option<ConstrainedOutput> {
     let value: Value = serde_json::from_str(content.trim()).ok()?;
     let name = value.get("name")?.as_str()?;
-    let arguments = value.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let arguments = value
+        .get("parameters")
+        .or_else(|| value.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     if name == RESPOND_SENTINEL {
         let text = arguments
             .get("text")
@@ -348,12 +357,12 @@ mod tests {
         let v = validator_for(&sample_tools());
         assert!(v.is_valid(&json!({
             "name": "fs.read",
-            "arguments": { "path": "/etc/hosts" },
+            "parameters": { "path": "/etc/hosts" },
         })));
         // The second tool too — both branches are reachable.
         assert!(v.is_valid(&json!({
             "name": "web.fetch",
-            "arguments": { "url": "https://example.com" },
+            "parameters": { "url": "https://example.com" },
         })));
     }
 
@@ -364,11 +373,11 @@ mod tests {
         // isn't in the registry. No branch's `const` matches.
         assert!(!v.is_valid(&json!({
             "name": "fs.write_file", // gemma4's classic hallucination
-            "arguments": { "path": "x", "content": "y" },
+            "parameters": { "path": "x", "content": "y" },
         })));
         assert!(!v.is_valid(&json!({
             "name": "browser_navigate",
-            "arguments": {},
+            "parameters": {},
         })));
     }
 
@@ -378,17 +387,17 @@ mod tests {
         // Real name, missing the required `path`.
         assert!(!v.is_valid(&json!({
             "name": "fs.read",
-            "arguments": {},
+            "parameters": {},
         })));
         // Real name, wrong type for `path`.
         assert!(!v.is_valid(&json!({
             "name": "fs.read",
-            "arguments": { "path": 123 },
+            "parameters": { "path": 123 },
         })));
         // Real name, an argument the schema doesn't allow.
         assert!(!v.is_valid(&json!({
             "name": "fs.read",
-            "arguments": { "path": "/x", "bogus": true },
+            "parameters": { "path": "/x", "bogus": true },
         })));
     }
 
@@ -397,35 +406,35 @@ mod tests {
         let v = validator_for(&sample_tools());
         assert!(v.is_valid(&json!({
             "name": RESPOND_SENTINEL,
-            "arguments": { "text": "I've finished the task." },
+            "parameters": { "text": "I've finished the task." },
         })));
         // …even with no tools registered — the escape is always
         // available so a constrained turn can produce plain text.
         let v_empty = validator_for(&[]);
         assert!(v_empty.is_valid(&json!({
             "name": "respond",
-            "arguments": { "text": "hello" },
+            "parameters": { "text": "hello" },
         })));
         // But the sentinel still has to be well-formed.
         assert!(!v_empty.is_valid(&json!({
             "name": "respond",
-            "arguments": {},
+            "parameters": {},
         })));
     }
 
     #[test]
     fn rejects_missing_top_level_fields_and_cross_tool_args() {
         let v = validator_for(&sample_tools());
-        // No `arguments` at all.
+        // No `parameters` at all.
         assert!(!v.is_valid(&json!({ "name": "fs.read" })));
         // No `name` at all.
-        assert!(!v.is_valid(&json!({ "arguments": { "path": "/x" } })));
+        assert!(!v.is_valid(&json!({ "parameters": { "path": "/x" } })));
         // fs.read's name with web.fetch's arguments — the name
         // const selects the fs.read branch, whose schema rejects
         // `url`/forbids the missing `path`.
         assert!(!v.is_valid(&json!({
             "name": "fs.read",
-            "arguments": { "url": "https://example.com" },
+            "parameters": { "url": "https://example.com" },
         })));
     }
 
@@ -433,9 +442,10 @@ mod tests {
 
     #[test]
     fn parse_constrained_real_tool_call() {
-        let out =
-            parse_constrained_output(r#"{"name": "fs.read", "arguments": {"path": "/etc/hosts"}}"#)
-                .expect("well-formed constrained call parses");
+        let out = parse_constrained_output(
+            r#"{"name": "fs.read", "parameters": {"path": "/etc/hosts"}}"#,
+        )
+        .expect("well-formed constrained call parses");
         assert_eq!(
             out,
             ConstrainedOutput::ToolCall {
@@ -448,7 +458,7 @@ mod tests {
     #[test]
     fn parse_constrained_respond_sentinel_unwraps_to_text() {
         let out =
-            parse_constrained_output(r#"{"name": "respond", "arguments": {"text": "All done."}}"#)
+            parse_constrained_output(r#"{"name": "respond", "parameters": {"text": "All done."}}"#)
                 .expect("sentinel parses");
         assert_eq!(out, ConstrainedOutput::Text("All done.".to_string()));
     }
@@ -456,7 +466,7 @@ mod tests {
     #[test]
     fn parse_constrained_tolerates_surrounding_whitespace() {
         let out = parse_constrained_output(
-            "\n  {\"name\": \"respond\", \"arguments\": {\"text\": \"hi\"}}\n",
+            "\n  {\"name\": \"respond\", \"parameters\": {\"text\": \"hi\"}}\n",
         )
         .expect("trimmed JSON parses");
         assert_eq!(out, ConstrainedOutput::Text("hi".to_string()));
@@ -521,7 +531,7 @@ mod tests {
     }
 
     fn call(name: &str, args: Value) -> Value {
-        json!({ "name": name, "arguments": args })
+        json!({ "name": name, "parameters": args })
     }
 
     fn set_tasks_schema(key: &str, prefix: &str) -> Value {
@@ -549,7 +559,7 @@ mod tests {
         assert!(v.is_valid(&call("web.fetch", json!({"url": "u"}))));
         let g = tool_call_grammar(&tools);
         assert!(g["$defs"]["set_tasks__TaskItem"].is_object());
-        let args = &g["oneOf"][2]["properties"]["arguments"];
+        let args = &g["oneOf"][2]["properties"]["parameters"];
         assert!(args.get("$defs").is_none());
     }
 
@@ -628,7 +638,7 @@ mod tests {
             "#/$defs/t__Inner"
         );
         assert_eq!(
-            g["oneOf"][0]["properties"]["arguments"]["properties"]["remote"]["$ref"],
+            g["oneOf"][0]["properties"]["parameters"]["properties"]["remote"]["$ref"],
             "https://example.com/s.json"
         );
     }
@@ -671,5 +681,64 @@ mod tests {
         assert!(v.is_valid(&call("t", json!({"a": "s", "b": 1}))));
         assert!(!v.is_valid(&call("t", json!({"a": 1, "b": 1}))));
         assert!(!v.is_valid(&call("t", json!({"a": "s", "b": "s"}))));
+    }
+
+    // ---- Name-first key order ----
+
+    #[test]
+    fn serialized_grammar_puts_name_before_parameters_in_every_branch() {
+        let g = tool_call_grammar(&sample_tools());
+        for branch in g["oneOf"].as_array().unwrap() {
+            let text = serde_json::to_string(branch).unwrap();
+            let n = text.find("\"name\":").expect("name key");
+            let p = text.find("\"parameters\":").expect("parameters key");
+            assert!(n < p, "name must precede parameters in {text}");
+            assert_eq!(branch["required"], json!(["name", "parameters"]));
+        }
+    }
+
+    #[test]
+    fn old_arguments_key_is_rejected_by_the_grammar() {
+        let v = validator_for(&sample_tools());
+        assert!(!v.is_valid(&json!({
+            "name": "fs.read",
+            "arguments": { "path": "/etc/hosts" },
+        })));
+        assert!(!v.is_valid(&json!({
+            "name": "respond",
+            "arguments": { "text": "hi" },
+        })));
+    }
+
+    #[test]
+    fn parse_constrained_accepts_parameters_and_legacy_arguments() {
+        let expect = ConstrainedOutput::ToolCall {
+            tool_name: "fs.read".to_string(),
+            input: json!({"path": "a"}),
+        };
+        assert_eq!(
+            parse_constrained_output(r#"{"name":"fs.read","parameters":{"path":"a"}}"#),
+            Some(expect)
+        );
+        assert_eq!(
+            parse_constrained_output(r#"{"name":"fs.read","arguments":{"path":"old"}}"#),
+            Some(ConstrainedOutput::ToolCall {
+                tool_name: "fs.read".to_string(),
+                input: json!({"path": "old"}),
+            })
+        );
+        assert_eq!(
+            parse_constrained_output(
+                r#"{"name":"fs.read","arguments":{"path":"old"},"parameters":{"path":"new"}}"#
+            ),
+            Some(ConstrainedOutput::ToolCall {
+                tool_name: "fs.read".to_string(),
+                input: json!({"path": "new"}),
+            })
+        );
+        assert_eq!(
+            parse_constrained_output(r#"{"name":"respond","arguments":{"text":"old"}}"#),
+            Some(ConstrainedOutput::Text("old".to_string()))
+        );
     }
 }

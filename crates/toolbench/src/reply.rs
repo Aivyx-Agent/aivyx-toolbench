@@ -82,7 +82,7 @@ pub fn parse_reply(mode: Mode, body: &Value) -> Reply {
                     }
                 }
                 Some(aivyx_stencil::ConstrainedOutput::Text(text)) => Reply::Text { text },
-                None => unparseable("content is not a {name, arguments} object"),
+                None => unparseable("content is not a {name, parameters} object"),
             }
         }
     }
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn grammar_replies_go_through_stencil() {
         let call =
-            native(json!({"content": "{\"name\":\"fs.read\",\"arguments\":{\"path\":\"a\"}}"}));
+            native(json!({"content": "{\"name\":\"fs.read\",\"parameters\":{\"path\":\"a\"}}"}));
         assert_eq!(
             parse_reply(Mode::Grammar, &call),
             Reply::ToolCall {
@@ -174,10 +174,20 @@ mod tests {
             }
         );
         let text =
-            native(json!({"content": "{\"name\":\"respond\",\"arguments\":{\"text\":\"4\"}}"}));
+            native(json!({"content": "{\"name\":\"respond\",\"parameters\":{\"text\":\"4\"}}"}));
         assert_eq!(
             parse_reply(Mode::Grammar, &text),
             Reply::Text { text: "4".into() }
+        );
+        let legacy =
+            native(json!({"content": "{\"name\":\"fs.read\",\"arguments\":{\"path\":\"a\"}}"}));
+        assert_eq!(
+            parse_reply(Mode::Grammar, &legacy),
+            Reply::ToolCall {
+                name: "fs.read".into(),
+                arguments: json!({"path": "a"}),
+                extra_calls: 0
+            }
         );
         let junk = native(json!({"content": "sure, here you go"}));
         assert!(matches!(
