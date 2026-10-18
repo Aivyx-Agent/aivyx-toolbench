@@ -107,6 +107,8 @@ async fn serve_on(
     let app = Router::new()
         .route("/v1/models", get(models))
         .route("/models", get(models))
+        // llama-server style readiness probe (pa's dev-run preflight needs it).
+        .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/v1/chat/completions", post(chat))
         .route("/chat/completions", post(chat))
         .with_state(shared);
@@ -217,5 +219,11 @@ mod tests {
             .await
             .unwrap();
         assert!(models.status().is_success());
+        let health = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert!(health.status().is_success());
     }
 }
