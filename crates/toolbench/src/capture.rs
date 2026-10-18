@@ -5,7 +5,7 @@
 //! the product finishes its turn normally.
 
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write as _};
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,7 +72,10 @@ pub fn snapshot_from_request(body: &Value, product: &str, source: &str) -> Resul
 pub struct Redactor {
     home: Vec<String>,
     user: Option<String>,
+    skipped_user: Option<String>,
 }
+
+const GENERIC_NAMES: [&str; 4] = ["user", "root", "home", "example"];
 
 impl Redactor {
     pub fn from_env() -> Self {
@@ -80,10 +83,7 @@ impl Redactor {
         let mut homes = Vec::new();
         if let Some(h) = &home {
             if let Ok(c) = std::fs::canonicalize(h) {
-                let c = c.to_string_lossy().into_owned();
-                if &c != h {
-                    homes.push(c);
-                }
+                homes.push(c.to_string_lossy().into_owned());
             }
             homes.push(h.clone());
         }
@@ -92,22 +92,43 @@ impl Redactor {
             .or_else(|| std::env::var("LOGNAME").ok())
             .or_else(|| {
                 home.as_deref()
-                    .and_then(|h| h.rsplit('/').next())
+                    .and_then(|h| h.trim_end_matches('/').rsplit('/').next())
                     .map(str::to_string)
-            })
-            .filter(|u| u.len() >= 3 && u != "user" && u != "root");
+            });
+        Self::new(homes, user)
+    }
+
+    fn new(homes: Vec<String>, user: Option<String>) -> Self {
+        let mut home: Vec<String> = Vec::new();
+        for h in homes {
+            let h = h.trim_end_matches('/').to_string();
+            if h.len() > 1 && !home.contains(&h) {
+                home.push(h);
+            }
+        }
+        let generic =
+            |u: &str| u.chars().count() < 3 || GENERIC_NAMES.contains(&u.to_lowercase().as_str());
+        let (user, skipped_user) = match user {
+            Some(u) if generic(&u) => (None, Some(u)),
+            other => (other, None),
+        };
         Self {
-            home: homes.into_iter().filter(|h| h.len() > 1).collect(),
+            home,
             user,
+            skipped_user,
         }
     }
 
     #[cfg(test)]
     fn for_test(home: &str, user: &str) -> Self {
-        Self {
-            home: vec![home.to_string()],
-            user: Some(user.to_string()),
-        }
+        Self::new(vec![home.to_string()], Some(user.to_string()))
+    }
+
+    /// A review warning when the user name was too generic to redact.
+    pub fn warning(&self) -> Option<String> {
+        self.skipped_user
+            .as_ref()
+            .map(|u| format!("user name `{u}` too short/generic to redact"))
     }
 
     /// Replaces private details; returns the text and counts per kind.
@@ -126,12 +147,14 @@ impl Redactor {
             }
         };
         for h in &self.home {
-            let re = regex::Regex::new(&regex::escape(h)).unwrap();
-            replace(&mut counts, &mut s, &re, "/home/user", "home path");
+            // The path must end at a boundary: `/home/al` is not `/home/alice`.
+            let re =
+                regex::Regex::new(&format!(r"{}([^A-Za-z0-9_.-]|$)", regex::escape(h))).unwrap();
+            replace(&mut counts, &mut s, &re, "/home/user${1}", "home path");
         }
-        let url_user = regex::Regex::new(r"([a-z][a-z0-9+.-]*://)[^/\s@]+@").unwrap();
+        let url_user = regex::Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/?#\s@]+@").unwrap();
         replace(&mut counts, &mut s, &url_user, "$1", "url credentials");
-        let email = regex::Regex::new(r"[\w.+-]+@[\w-]+\.[\w.]+").unwrap();
+        let email = regex::Regex::new(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}").unwrap();
         // Keep the placeholder itself.
         let n = email
             .find_iter(&s)
@@ -141,29 +164,49 @@ impl Redactor {
             s = email.replace_all(&s, "user@example.com").into_owned();
             *counts.entry("email").or_insert(0) += n;
         }
-        let ip = regex::Regex::new(r"\b(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap();
-        let keep = |c: &regex::Captures| {
-            &c[1] == "127" || c[0].starts_with("192.0.2.") || &c[0] == "0.0.0.0"
-        };
-        let n = ip.captures_iter(&s).filter(|c| !keep(c)).count();
+        let (ips, n) = redact_ips(&s);
         if n > 0 {
-            s = ip
-                .replace_all(&s, |c: &regex::Captures| {
-                    if keep(c) {
-                        c[0].to_string()
-                    } else {
-                        "192.0.2.1".to_string()
-                    }
-                })
-                .into_owned();
+            s = ips;
             *counts.entry("ip address").or_insert(0) += n;
         }
         if let Some(u) = &self.user {
-            let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(u))).unwrap();
+            let re = regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(u))).unwrap();
             replace(&mut counts, &mut s, &re, "user", "user name");
         }
         (s, counts)
     }
+}
+
+/// Replaces public-looking IPv4 addresses (not 127.x, 192.0.2.x, 0.0.0.0).
+/// Letters or underscores may touch the address; digits and dots may not
+/// (so `1.2.3.4.5` stays).
+fn redact_ips(s: &str) -> (String, usize) {
+    let re = regex::Regex::new(r"\d{1,3}(?:\.\d{1,3}){3}").unwrap();
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0;
+    let mut n = 0;
+    for m in re.find_iter(s) {
+        let before = s[..m.start()].chars().next_back();
+        let after = s[m.end()..].chars();
+        let mut it = after.clone();
+        let glued_after = match it.next() {
+            Some(c) if c.is_ascii_digit() => true,
+            Some('.') => it.next().is_some_and(|c| c.is_ascii_digit()),
+            _ => false,
+        };
+        let glued_before = before.is_some_and(|c| c.is_ascii_digit() || c == '.');
+        let ip = m.as_str();
+        let keep = ip.starts_with("127.") || ip.starts_with("192.0.2.") || ip == "0.0.0.0";
+        if glued_before || glued_after || keep {
+            continue;
+        }
+        out.push_str(&s[last..m.start()]);
+        out.push_str("192.0.2.1");
+        last = m.end();
+        n += 1;
+    }
+    out.push_str(&s[last..]);
+    (out, n)
 }
 
 /// Lines worth a human look after redaction: token-like strings and
@@ -180,7 +223,35 @@ pub fn flags(text: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// Redacts the prompt and every tool description; counts are merged.
+/// Redacts every string leaf of a JSON value in place (keys untouched).
+fn redact_value(
+    v: &mut Value,
+    r: &Redactor,
+    merge: &mut impl FnMut(BTreeMap<&'static str, usize>),
+) {
+    match v {
+        Value::String(s) => {
+            let (t, c) = r.redact(s);
+            merge(c);
+            *s = t;
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| redact_value(x, r, merge)),
+        Value::Object(o) => o.values_mut().for_each(|x| redact_value(x, r, merge)),
+        _ => {}
+    }
+}
+
+fn string_leaves<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+    match v {
+        Value::String(s) => out.push(s),
+        Value::Array(a) => a.iter().for_each(|x| string_leaves(x, out)),
+        Value::Object(o) => o.values().for_each(|x| string_leaves(x, out)),
+        _ => {}
+    }
+}
+
+/// Redacts the prompt, tool descriptions and schema string leaves; counts
+/// are merged.
 fn redacted_snapshot(
     mut snap: Snapshot,
     r: &Redactor,
@@ -200,6 +271,7 @@ fn redacted_snapshot(
         let (d, c) = r.redact(&t.description);
         merge(c);
         t.description = d;
+        redact_value(&mut t.input_schema, r, &mut merge);
     }
     if !total.is_empty() {
         let parts: Vec<String> = total
@@ -209,6 +281,31 @@ fn redacted_snapshot(
         snap.source = format!("{}; redacted: {}", snap.source, parts.join(", "));
     }
     (snap, total)
+}
+
+/// Review lines for everything worth a human look in the (redacted)
+/// snapshot: prompt, tool names, descriptions and schema string leaves.
+fn review_flags(snap: &Snapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    for (n, c) in flags(snap.system_prompt.as_deref().unwrap_or("")) {
+        out.push(format!("system prompt line {n}: {c}"));
+    }
+    for t in &snap.tools {
+        for (n, c) in flags(&t.name) {
+            out.push(format!("tool name line {n}: {c}"));
+        }
+        for (n, c) in flags(&t.description) {
+            out.push(format!("{} description line {n}: {c}", t.name));
+        }
+        let mut leaves = Vec::new();
+        string_leaves(&t.input_schema, &mut leaves);
+        for leaf in leaves {
+            for (n, c) in flags(leaf) {
+                out.push(format!("{} schema line {n}: {c}", t.name));
+            }
+        }
+    }
+    out
 }
 
 /// Refuses a non-loopback listen address unless explicitly allowed.
@@ -234,6 +331,8 @@ enum CaptureState {
 pub struct CaptureOptions {
     pub accept: bool,
     pub redact: bool,
+    /// Whether stdin is a terminal; decided once by the caller.
+    pub interactive: bool,
 }
 
 #[derive(Clone)]
@@ -248,7 +347,8 @@ struct Shared {
 /// Prints the review, decides, and saves or declines one snapshot.
 async fn review(s: Shared, snap: Snapshot) {
     let snap = if s.opts.redact {
-        let (snap, counts) = redacted_snapshot(snap, &Redactor::from_env());
+        let r = Redactor::from_env();
+        let (snap, counts) = redacted_snapshot(snap, &r);
         let parts: Vec<String> = counts
             .iter()
             .map(|(k, n)| format!("{k} \u{d7}{n}"))
@@ -261,42 +361,41 @@ async fn review(s: Shared, snap: Snapshot) {
                 parts.join(", ")
             }
         );
+        if let Some(w) = r.warning() {
+            eprintln!("capture: review: warning: {w}");
+        }
         snap
     } else {
         eprintln!("capture: warning: --no-redact; private details may be saved");
         snap
     };
-    let prompt = snap.system_prompt.as_deref().unwrap_or("");
     eprintln!(
         "capture: review: product {}, {} tools, system prompt {} chars",
         snap.product,
         snap.tools.len(),
-        prompt.chars().count()
+        snap.system_prompt.as_deref().unwrap_or("").chars().count()
     );
-    let mut flagged = Vec::new();
-    for (n, c) in flags(prompt) {
-        flagged.push(format!("system prompt line {n}: {c}"));
-    }
-    for t in &snap.tools {
-        for (n, c) in flags(&t.description) {
-            flagged.push(format!("{} line {n}: {c}", t.name));
-        }
-    }
-    for f in &flagged {
+    for f in review_flags(&snap) {
         eprintln!("capture: review: flagged {f}");
     }
     let save = if s.opts.accept {
         true
-    } else if std::io::stdin().is_terminal() {
-        tokio::task::spawn_blocking(|| {
+    } else if s.opts.interactive {
+        let asked = tokio::task::spawn_blocking(|| {
             eprint!("save this snapshot? [y/N] ");
             let _ = std::io::stderr().flush();
             let mut line = String::new();
             std::io::stdin().read_line(&mut line).is_ok()
                 && matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
         })
-        .await
-        .unwrap_or(false)
+        .await;
+        match asked {
+            Ok(yes) => yes,
+            Err(e) => {
+                eprintln!("capture: prompt failed ({e}); treating as no");
+                false
+            }
+        }
     } else {
         eprintln!("capture: not saved: re-run with --accept after reviewing");
         false
@@ -335,7 +434,15 @@ pub async fn serve(
     eprintln!(
         "capture: listening on http://{listen}/v1 — point {product} at it and send one message (Ctrl-C to stop)"
     );
-    serve_on(listener, product, source, out, opts).await
+    serve_on(
+        listener,
+        product,
+        source,
+        out,
+        opts,
+        Arc::new(Mutex::new(CaptureState::Waiting)),
+    )
+    .await
 }
 
 async fn serve_on(
@@ -344,13 +451,14 @@ async fn serve_on(
     source: String,
     out: PathBuf,
     opts: CaptureOptions,
+    state: Arc<Mutex<CaptureState>>,
 ) -> Result<()> {
     let shared = Shared {
         product,
         source,
         out,
         opts,
-        state: Arc::new(Mutex::new(CaptureState::Waiting)),
+        state,
     };
     let models = || async {
         Json(json!({"object": "list", "data": [{"id": "capture", "object": "model"}]}))
@@ -439,7 +547,9 @@ mod tests {
                 CaptureOptions {
                     accept: true,
                     redact: false,
+                    interactive: false,
                 },
+                Arc::new(Mutex::new(CaptureState::Waiting)),
             )
             .await
             .unwrap()
@@ -492,12 +602,21 @@ mod tests {
         panic!("{} was not written within 5 s", path.display());
     }
 
-    async fn post_tools(accept: bool) -> (tempfile::TempDir, PathBuf, reqwest::StatusCode) {
+    async fn post_tools(
+        accept: bool,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        reqwest::StatusCode,
+        Arc<Mutex<CaptureState>>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("pa.json");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let out2 = out.clone();
+        let state = Arc::new(Mutex::new(CaptureState::Waiting));
+        let state2 = state.clone();
         tokio::spawn(async move {
             serve_on(
                 listener,
@@ -507,7 +626,9 @@ mod tests {
                 CaptureOptions {
                     accept,
                     redact: true,
+                    interactive: false,
                 },
+                state2,
             )
             .await
             .unwrap()
@@ -519,37 +640,144 @@ mod tests {
             .await
             .unwrap()
             .status();
-        (dir, out, status)
+        (dir, out, status, state)
+    }
+
+    /// Polls until the review has finished; returns the final state.
+    async fn settled(state: &Arc<Mutex<CaptureState>>) -> CaptureState {
+        for _ in 0..100 {
+            let s = *state.lock().await;
+            if s != CaptureState::Reviewing {
+                return s;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("review did not finish within 5 s");
     }
 
     #[tokio::test]
     async fn without_accept_nothing_is_saved() {
-        let (_dir, out, status) = post_tools(false).await;
+        let (_dir, out, status, state) = post_tools(false).await;
         assert!(status.is_success());
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(settled(&state).await, CaptureState::Waiting);
         assert!(!out.exists());
     }
 
     #[tokio::test]
     async fn with_accept_the_snapshot_is_saved() {
-        let (_dir, out, status) = post_tools(true).await;
+        let (_dir, out, status, state) = post_tools(true).await;
         assert!(status.is_success());
-        wait_for(&out).await;
+        assert_eq!(settled(&state).await, CaptureState::Done);
         assert_eq!(Snapshot::load(&out).unwrap().tools.len(), 2);
     }
 
-    #[test]
-    fn redacted_snapshot_cleans_prompt_and_descriptions_and_notes_source() {
+    fn schema_snapshot() -> Snapshot {
         let mut snap = snapshot_from_request(&request(), "pa", "test").unwrap();
-        snap.system_prompt = Some("Home is /home/alice/x".into());
-        snap.tools[0].description = "alice at a@b.co".into();
-        let (snap, counts) = redacted_snapshot(snap, &Redactor::for_test("/home/alice", "alice"));
-        assert_eq!(snap.system_prompt.as_deref(), Some("Home is /home/user/x"));
-        assert_eq!(snap.tools[0].description, "user at user@example.com");
-        assert_eq!(counts["home path"], 1);
-        assert_eq!(counts["user name"], 1);
-        assert!(snap.source.contains("redacted: "), "{}", snap.source);
-        assert!(snap.source.contains("home path \u{d7}1"), "{}", snap.source);
+        snap.tools[0].input_schema = json!({"type": "object", "properties": {
+            "path": {"description": "under /home/alice/docs",
+                     "default": "/home/alice/x",
+                     "enum": ["/home/alice/a", "bob@corp.com"]}},
+            "required": ["path"]});
+        snap
+    }
+
+    #[test]
+    fn schema_string_leaves_are_redacted_and_keys_kept() {
+        let (snap, counts) = redacted_snapshot(
+            schema_snapshot(),
+            &Redactor::for_test("/home/alice", "alice"),
+        );
+        let text = serde_json::to_string(&snap.tools[0].input_schema).unwrap();
+        assert!(
+            !text.contains("alice") && !text.contains("corp.com"),
+            "{text}"
+        );
+        let p = &snap.tools[0].input_schema["properties"]["path"];
+        assert_eq!(p["default"], "/home/user/x");
+        assert_eq!(p["enum"][1], "user@example.com");
+        assert_eq!(snap.tools[0].input_schema["required"][0], "path");
+        assert_eq!(counts["home path"], 3);
+        assert_eq!(counts["email"], 1);
+    }
+
+    #[test]
+    fn review_flags_cover_schema_leaves_and_tool_names() {
+        let mut snap = schema_snapshot();
+        snap.tools[0].input_schema["properties"]["path"]["description"] =
+            json!("## Learned skills");
+        snap.tools[1].name = "t".repeat(40);
+        let f = review_flags(&snap);
+        assert!(f.iter().any(|l| l.contains("Learned")), "{f:?}");
+        assert!(f.iter().any(|l| l.contains(&"t".repeat(40))), "{f:?}");
+    }
+
+    #[test]
+    fn home_match_needs_a_path_boundary_and_ignores_trailing_slash() {
+        let r = Redactor::for_test("/home/al", "xyz1");
+        assert_eq!(r.redact("/home/alice/x").0, "/home/alice/x");
+        let r = Redactor::for_test("/home/al/", "xyz1");
+        assert_eq!(
+            r.redact("/home/al/x and /home/al").0,
+            "/home/user/x and /home/user"
+        );
+    }
+
+    #[test]
+    fn url_userinfo_is_case_insensitive_and_stops_at_delimiters() {
+        let r = Redactor::for_test("/h/none", "xyz1");
+        assert_eq!(r.redact("HTTPS://bob:pw@host/x").0, "HTTPS://host/x");
+        let (s, c) = r.redact("https://host?x=a@b.com");
+        assert_eq!(s, "https://host?x=user@example.com");
+        assert!(!c.contains_key("url credentials"));
+    }
+
+    #[test]
+    fn email_has_no_trailing_dot_and_ignores_package_versions() {
+        let r = Redactor::for_test("/h/none", "xyz1");
+        assert_eq!(r.redact("npx pkg@1.2.3").0, "npx pkg@1.2.3");
+        let (s, c) = r.redact("mail user@example.com.");
+        assert_eq!(s, "mail user@example.com.");
+        assert!(c.is_empty());
+        assert_eq!(r.redact("a@b.co.uk.").0, "user@example.com.");
+    }
+
+    #[test]
+    fn ipv4_glued_to_letters_is_redacted_but_versions_and_exclusions_stay() {
+        let r = Redactor::for_test("/h/none", "xyz1");
+        assert_eq!(r.redact("host10.0.0.5").0, "host192.0.2.1");
+        assert_eq!(r.redact("a 10.0.0.1 10.0.0.2.").0, "a 192.0.2.1 192.0.2.1.");
+        assert_eq!(r.redact("1.2.3.4.5").0, "1.2.3.4.5");
+        assert_eq!(
+            r.redact("127.0.0.1 192.0.2.7 0.0.0.0").0,
+            "127.0.0.1 192.0.2.7 0.0.0.0"
+        );
+    }
+
+    #[test]
+    fn user_name_is_case_insensitive_and_generic_names_are_skipped() {
+        let r = Redactor::for_test("/h/none", "Alice");
+        assert_eq!(r.redact("ALICE and alice").0, "user and user");
+        assert!(r.warning().is_none());
+        for bad in ["ab", "root", "Home", "example", "user"] {
+            let r = Redactor::for_test("/h/none", bad);
+            assert_eq!(r.redact(&format!("{bad} here")).0, format!("{bad} here"));
+            let w = r.warning().unwrap();
+            assert!(
+                w.contains(&format!("`{bad}`")) && w.contains("too short/generic"),
+                "{w}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_suffix_lists_kinds_sorted_and_comma_separated() {
+        let mut snap = snapshot_from_request(&request(), "pa", "test").unwrap();
+        snap.system_prompt = Some("/home/alice a@b.co".into());
+        let (snap, _) = redacted_snapshot(snap, &Redactor::for_test("/home/alice", "xyz1"));
+        assert_eq!(
+            snap.source,
+            "test; redacted: email \u{d7}1, home path \u{d7}1"
+        );
     }
 
     #[test]
@@ -587,5 +815,6 @@ mod tests {
         assert!(check_listen(lo, false).is_ok());
         assert!(check_listen(any, false).is_err());
         assert!(check_listen(any, true).is_ok());
+        assert!(check_listen("[::1]:1".parse().unwrap(), false).is_ok());
     }
 }

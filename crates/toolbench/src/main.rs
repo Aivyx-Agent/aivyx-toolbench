@@ -225,6 +225,7 @@ async fn main() -> Result<()> {
             let opts = toolbench::capture::CaptureOptions {
                 accept,
                 redact: !no_redact,
+                interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
             };
             toolbench::capture::serve(listen, product, source, out, opts).await?;
         }
