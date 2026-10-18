@@ -84,12 +84,91 @@ pub const RESPOND_SENTINEL: &str = "respond";
 /// still admits the sentinel, so a constrained turn can always
 /// produce *something* well-formed.
 pub fn tool_call_grammar(tools: &[ToolSpec]) -> Value {
-    let mut branches: Vec<Value> = tools
-        .iter()
-        .map(|t| tool_branch(&t.name, &t.input_schema))
-        .collect();
+    let mut branches: Vec<Value> = Vec::with_capacity(tools.len() + 1);
+    let mut hoisted = serde_json::Map::new();
+    for t in tools {
+        let mut schema = t.input_schema.clone();
+        if let Some(obj) = schema.as_object_mut() {
+            let mut defs: Vec<(String, Value)> = Vec::new();
+            for key in ["$defs", "definitions"] {
+                if let Some(Value::Object(m)) = obj.remove(key) {
+                    defs.extend(m);
+                }
+            }
+            if !defs.is_empty() {
+                let tool = sanitize_tool_name(&t.name);
+                let renames: std::collections::HashMap<&str, String> = defs
+                    .iter()
+                    .map(|(n, _)| (n.as_str(), unique_def_key(&tool, n, &hoisted)))
+                    .collect();
+                rewrite_refs(&mut schema, &renames);
+                for (n, mut d) in defs.clone() {
+                    rewrite_refs(&mut d, &renames);
+                    hoisted.insert(renames[n.as_str()].clone(), d);
+                }
+            }
+        }
+        branches.push(tool_branch(&t.name, &schema));
+    }
     branches.push(respond_branch());
-    json!({ "oneOf": branches })
+    let mut grammar = json!({ "oneOf": branches });
+    if !hoisted.is_empty() {
+        grammar["$defs"] = Value::Object(hoisted);
+    }
+    grammar
+}
+
+/// Sanitised tool name used as the `$defs` key prefix.
+fn sanitize_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `<tool>__<def>`, suffixed `__2`, `__3`, … until not in `taken`.
+fn unique_def_key(tool: &str, def: &str, taken: &serde_json::Map<String, Value>) -> String {
+    let base = format!("{tool}__{def}");
+    let mut key = base.clone();
+    let mut n = 2;
+    while taken.contains_key(&key) {
+        key = format!("{base}__{n}");
+        n += 1;
+    }
+    key
+}
+
+/// Recursively rewrite local `#/$defs/<n>` / `#/definitions/<n>` refs
+/// whose `<n>` is in `renames` to `#/$defs/<escaped new key>`.
+fn rewrite_refs(v: &mut Value, renames: &std::collections::HashMap<&str, String>) {
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m.iter_mut() {
+                if k == "$ref"
+                    && let Value::String(r) = val
+                {
+                    let name = r
+                        .strip_prefix("#/$defs/")
+                        .or_else(|| r.strip_prefix("#/definitions/"));
+                    if let Some(name) = name {
+                        let name = name.replace("~1", "/").replace("~0", "~");
+                        if let Some(new) = renames.get(name.as_str()) {
+                            *r = format!("#/$defs/{}", new.replace('~', "~0").replace('/', "~1"));
+                        }
+                    }
+                } else {
+                    rewrite_refs(val, renames);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| rewrite_refs(x, renames)),
+        _ => {}
+    }
 }
 
 /// One union branch: `name` pinned to `name`, `arguments` set to
@@ -409,5 +488,149 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // ---- Local $defs hoisting ----
+
+    fn tool(name: &str, schema: Value) -> ToolSpec {
+        ToolSpec {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: schema,
+        }
+    }
+
+    fn call(name: &str, args: Value) -> Value {
+        json!({ "name": name, "arguments": args })
+    }
+
+    fn set_tasks_schema(key: &str, prefix: &str) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "tasks": { "type": "array",
+                "items": { "$ref": format!("#/{prefix}/TaskItem") } } },
+            "required": ["tasks"],
+            key: { "TaskItem": {
+                "type": "object",
+                "properties": { "title": { "type": "string" } },
+                "required": ["title"],
+            } },
+        })
+    }
+
+    #[test]
+    fn hoists_defs_into_grammar_root() {
+        let mut tools = sample_tools();
+        tools.push(tool("set_tasks", set_tasks_schema("$defs", "$defs")));
+        let v = validator_for(&tools);
+        assert!(v.is_valid(&call("set_tasks", json!({"tasks": [{"title": "a"}]}))));
+        assert!(!v.is_valid(&call("set_tasks", json!({"tasks": [{"nope": 1}]}))));
+        assert!(v.is_valid(&call("fs.read", json!({"path": "/x"}))));
+        assert!(v.is_valid(&call("web.fetch", json!({"url": "u"}))));
+        let g = tool_call_grammar(&tools);
+        assert!(g["$defs"]["set_tasks__TaskItem"].is_object());
+        let args = &g["oneOf"][2]["properties"]["arguments"];
+        assert!(args.get("$defs").is_none());
+    }
+
+    #[test]
+    fn hoists_legacy_definitions() {
+        let mut tools = sample_tools();
+        tools.push(tool(
+            "set_tasks",
+            set_tasks_schema("definitions", "definitions"),
+        ));
+        let v = validator_for(&tools);
+        assert!(v.is_valid(&call("set_tasks", json!({"tasks": [{"title": "a"}]}))));
+        assert!(!v.is_valid(&call("set_tasks", json!({"tasks": [{"nope": 1}]}))));
+        assert!(v.is_valid(&call("fs.read", json!({"path": "/x"}))));
+    }
+
+    #[test]
+    fn same_def_name_in_two_tools_does_not_clash() {
+        let a = tool("a", set_tasks_schema("$defs", "$defs"));
+        let b = tool(
+            "b",
+            json!({
+                "type": "object",
+                "properties": { "x": { "$ref": "#/$defs/TaskItem" } },
+                "required": ["x"],
+                "$defs": { "TaskItem": { "type": "integer" } },
+            }),
+        );
+        let v = validator_for(&[a, b]);
+        assert!(v.is_valid(&call("a", json!({"tasks": [{"title": "t"}]}))));
+        assert!(!v.is_valid(&call("a", json!({"tasks": [1]}))));
+        assert!(v.is_valid(&call("b", json!({"x": 3}))));
+        assert!(!v.is_valid(&call("b", json!({"x": "s"}))));
+    }
+
+    #[test]
+    fn colliding_sanitized_tool_names_get_unique_keys() {
+        let mk = |n: &str| tool(n, set_tasks_schema("$defs", "$defs"));
+        let g = tool_call_grammar(&[mk("fs.read"), mk("fs_read")]);
+        let defs = g["$defs"].as_object().unwrap();
+        assert!(defs.contains_key("fs_read__TaskItem"));
+        assert!(defs.contains_key("fs_read__TaskItem__2"));
+        jsonschema::validator_for(&g).expect("compiles");
+    }
+
+    #[test]
+    fn tool_without_defs_branch_is_unchanged() {
+        let tools = sample_tools();
+        let g = tool_call_grammar(&tools);
+        assert!(g.get("$defs").is_none());
+        for (i, t) in tools.iter().enumerate() {
+            assert_eq!(g["oneOf"][i], tool_branch(&t.name, &t.input_schema));
+        }
+    }
+
+    #[test]
+    fn nested_ref_between_sibling_defs_is_rewritten() {
+        let t = tool(
+            "t",
+            json!({
+                "type": "object",
+                "properties": { "o": { "$ref": "#/$defs/Outer" },
+                                "remote": { "$ref": "https://example.com/s.json" } },
+                "required": ["o"],
+                "$defs": {
+                    "Outer": { "type": "object",
+                        "properties": { "i": { "$ref": "#/$defs/Inner" } },
+                        "required": ["i"] },
+                    "Inner": { "type": "string" },
+                },
+            }),
+        );
+        let g = tool_call_grammar(std::slice::from_ref(&t));
+        assert_eq!(
+            g["$defs"]["t__Outer"]["properties"]["i"]["$ref"],
+            "#/$defs/t__Inner"
+        );
+        assert_eq!(
+            g["oneOf"][0]["properties"]["arguments"]["properties"]["remote"]["$ref"],
+            "https://example.com/s.json"
+        );
+    }
+
+    #[test]
+    fn nested_ref_validates_end_to_end() {
+        let t = tool(
+            "t",
+            json!({
+                "type": "object",
+                "properties": { "o": { "$ref": "#/$defs/Outer" } },
+                "required": ["o"],
+                "$defs": {
+                    "Outer": { "type": "object",
+                        "properties": { "i": { "$ref": "#/$defs/Inner" } },
+                        "required": ["i"] },
+                    "Inner": { "type": "string" },
+                },
+            }),
+        );
+        let v = validator_for(&[t]);
+        assert!(v.is_valid(&call("t", json!({"o": {"i": "s"}}))));
+        assert!(!v.is_valid(&call("t", json!({"o": {"i": 1}}))));
     }
 }

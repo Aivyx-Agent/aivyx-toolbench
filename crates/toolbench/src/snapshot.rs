@@ -141,4 +141,16 @@ mod tests {
         write("pa2.json", "pa");
         assert!(load_dir(dir.path()).is_err());
     }
+
+    #[test]
+    fn coder_snapshot_grammar_compiles() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tools");
+        for f in ["coder.json", "pa.json"] {
+            let text = std::fs::read_to_string(dir.join(f)).unwrap();
+            let snap: Snapshot = serde_json::from_str(&text).unwrap();
+            let grammar = aivyx_stencil::tool_call_grammar(&snap.tools);
+            jsonschema::validator_for(&grammar)
+                .unwrap_or_else(|e| panic!("{f}: grammar must compile: {e}"));
+        }
+    }
 }
