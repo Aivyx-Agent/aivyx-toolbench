@@ -1,0 +1,11 @@
+id = "coder-required-grep"
+product = "coder"
+category = "required_args"
+messages = [
+  { role = "user", content = "Search for the string TODO in src" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "grep"
+args.pattern = { contains = "TODO" }

@@ -1,0 +1,11 @@
+id = "pa-similar-git-diff"
+product = "pa"
+category = "similar_tools"
+messages = [
+  { role = "user", content = "What changed in my repo since the last commit? Show the actual changes." },
+]
+
+[expect]
+kind = "tool_call"
+tool = "shell.exec"
+args.cmd = { contains = "git" }

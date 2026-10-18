@@ -1,0 +1,10 @@
+id = "coder-rare-definition"
+product = "coder"
+category = "rare_tool"
+messages = [
+  { role = "user", content = "Jump to the definition of `Settings` in src/config.rs line 40" },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["go_to_definition", "grep"]

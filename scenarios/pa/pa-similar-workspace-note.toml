@@ -1,0 +1,11 @@
+id = "pa-similar-workspace-note"
+product = "pa"
+category = "similar_tools"
+messages = [
+  { role = "user", content = "Jot a note in your workspace: call the plumber Monday" },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["workspace.note", "workspace.write"]
+args.content = { contains = "plumber" }

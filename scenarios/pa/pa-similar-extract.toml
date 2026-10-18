@@ -1,0 +1,11 @@
+id = "pa-similar-extract"
+product = "pa"
+category = "similar_tools"
+messages = [
+  { role = "user", content = "Give me just the main text of https://example.com/post, no HTML" },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["web.extract", "web.fetch"]
+args.url = { contains = "example.com/post" }

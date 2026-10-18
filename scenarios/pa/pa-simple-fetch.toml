@@ -1,0 +1,11 @@
+id = "pa-simple-fetch"
+product = "pa"
+category = "simple"
+messages = [
+  { role = "user", content = "Get the page at https://example.com/changelog" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "web.fetch"
+args.url = { contains = "example.com/changelog" }

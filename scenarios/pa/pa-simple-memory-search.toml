@@ -1,0 +1,10 @@
+id = "pa-simple-memory-search"
+product = "pa"
+category = "simple"
+messages = [
+  { role = "user", content = "What did I tell you about my dentist appointment?" },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["memory.search", "memory.read"]

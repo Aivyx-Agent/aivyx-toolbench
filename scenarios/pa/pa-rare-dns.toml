@@ -1,0 +1,11 @@
+id = "pa-rare-dns"
+product = "pa"
+category = "rare_tool"
+messages = [
+  { role = "user", content = "Check whether mail.example.net has an address record" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "net.dns"
+args.host = { contains = "mail.example.net" }

@@ -367,4 +367,28 @@ tool = "fs.write"
         let err = load_dir(dir.path(), &snapshots()).unwrap_err();
         assert!(err.to_string().contains("pa-read"), "{err}");
     }
+
+    /// The committed scenarios load against the committed snapshots.
+    #[test]
+    fn the_repository_scenarios_are_valid() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let snaps = crate::snapshot::load_dir(&root.join("fixtures/tools")).unwrap();
+        let all = load_dir(&root.join("scenarios"), &snaps).unwrap();
+        assert_eq!(all.len(), 60);
+        for cat in [
+            Category::Simple,
+            Category::SimilarTools,
+            Category::RequiredArgs,
+            Category::OptionalArgs,
+            Category::NoTool,
+            Category::MultiStep,
+            Category::RareTool,
+            Category::Misleading,
+        ] {
+            assert!(
+                all.iter().filter(|s| s.category == cat).count() >= 6,
+                "{cat:?}"
+            );
+        }
+    }
 }

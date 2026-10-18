@@ -1,0 +1,9 @@
+id = "coder-notool-thanks"
+product = "coder"
+category = "no_tool"
+messages = [
+  { role = "user", content = "Thanks, that's all for now." },
+]
+
+[expect]
+kind = "respond"

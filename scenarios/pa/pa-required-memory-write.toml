@@ -1,0 +1,11 @@
+id = "pa-required-memory-write"
+product = "pa"
+category = "required_args"
+messages = [
+  { role = "user", content = "Remember that my sister's birthday is 3 March" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "memory.write"
+args.body = { contains = "3 March" }

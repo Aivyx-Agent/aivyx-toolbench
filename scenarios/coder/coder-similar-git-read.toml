@@ -1,0 +1,10 @@
+id = "coder-similar-git-read"
+product = "coder"
+category = "similar_tools"
+messages = [
+  { role = "user", content = "What's the current git status?" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "git_read"

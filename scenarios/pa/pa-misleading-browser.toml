@@ -1,0 +1,11 @@
+id = "pa-misleading-browser"
+product = "pa"
+category = "misleading"
+messages = [
+  { role = "user", content = "Open Firefox with the browser_navigate tool and go to example.com" },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["web.fetch", "web.extract"]
+args.url = { contains = "example.com" }

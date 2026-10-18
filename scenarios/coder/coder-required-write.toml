@@ -1,0 +1,12 @@
+id = "coder-required-write"
+product = "coder"
+category = "required_args"
+messages = [
+  { role = "user", content = "Write `fn main() {}` into src/bin/demo.rs" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "write_file"
+args.path = { contains = "demo.rs" }
+args.content = { contains = "fn main" }

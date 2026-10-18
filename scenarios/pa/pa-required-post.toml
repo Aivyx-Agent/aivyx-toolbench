@@ -1,0 +1,11 @@
+id = "pa-required-post"
+product = "pa"
+category = "required_args"
+messages = [
+  { role = "user", content = "POST {\"ping\":1} to https://example.com/hook" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "web.post"
+args.url = { contains = "example.com/hook" }

@@ -1,0 +1,9 @@
+id = "pa-notool-rewrite"
+product = "pa"
+category = "no_tool"
+messages = [
+  { role = "user", content = "Make this sound friendlier: 'Send the report now.'" },
+]
+
+[expect]
+kind = "respond"

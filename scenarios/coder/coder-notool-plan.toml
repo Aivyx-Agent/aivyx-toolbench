@@ -1,0 +1,9 @@
+id = "coder-notool-plan"
+product = "coder"
+category = "no_tool"
+messages = [
+  { role = "user", content = "Before touching anything: in two sentences, how would you add logging?" },
+]
+
+[expect]
+kind = "respond"

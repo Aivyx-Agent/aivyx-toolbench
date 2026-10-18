@@ -1,0 +1,11 @@
+id = "pa-optional-memory-search"
+product = "pa"
+category = "optional_args"
+messages = [
+  { role = "user", content = "Search your memory for 'garden'" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "memory.search"
+args.query = { contains = "garden" }

@@ -1,0 +1,11 @@
+id = "coder-simple-grep"
+product = "coder"
+category = "simple"
+messages = [
+  { role = "user", content = "Find every place we call `unwrap()`" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "grep"
+args.pattern = { contains = "unwrap" }

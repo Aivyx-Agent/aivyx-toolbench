@@ -1,0 +1,9 @@
+id = "pa-notool-math"
+product = "pa"
+category = "no_tool"
+messages = [
+  { role = "user", content = "What's 17 times 23?" },
+]
+
+[expect]
+kind = "respond"

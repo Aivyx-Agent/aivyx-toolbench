@@ -1,0 +1,12 @@
+id = "pa-required-write"
+product = "pa"
+category = "required_args"
+messages = [
+  { role = "user", content = "Save 'buy milk' to ~/notes/shopping.md" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "fs.write"
+args.path = { contains = "shopping.md" }
+args.content = { contains = "milk" }

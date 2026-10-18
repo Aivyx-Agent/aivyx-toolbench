@@ -1,0 +1,11 @@
+id = "coder-optional-glob"
+product = "coder"
+category = "optional_args"
+messages = [
+  { role = "user", content = "Find all *.rs files" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "glob"
+args.pattern = { contains = ".rs" }

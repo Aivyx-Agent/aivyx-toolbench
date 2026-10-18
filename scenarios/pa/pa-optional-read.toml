@@ -1,0 +1,11 @@
+id = "pa-optional-read"
+product = "pa"
+category = "optional_args"
+messages = [
+  { role = "user", content = "Show me ~/notes/journal.md" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "fs.read"
+args.path = { contains = "journal.md" }

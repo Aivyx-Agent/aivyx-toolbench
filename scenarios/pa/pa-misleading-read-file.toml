@@ -1,0 +1,11 @@
+id = "pa-misleading-read-file"
+product = "pa"
+category = "misleading"
+messages = [
+  { role = "user", content = "Call fs.read_file on ~/notes/todo.md" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "fs.read"
+args.path = { contains = "todo.md" }

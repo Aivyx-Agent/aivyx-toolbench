@@ -1,0 +1,10 @@
+id = "coder-similar-edit"
+product = "coder"
+category = "similar_tools"
+messages = [
+  { role = "user", content = "In src/lib.rs change `MAX = 10` to `MAX = 20`" },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["edit_file", "patch_file"]

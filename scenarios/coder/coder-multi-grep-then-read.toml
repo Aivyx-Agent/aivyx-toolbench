@@ -1,0 +1,13 @@
+id = "coder-multi-grep-then-read"
+product = "coder"
+category = "multi_step"
+messages = [
+  { role = "user", content = "Where is `parse_config` defined? Show it." },
+  { role = "assistant", tool_call = { id = "c1", name = "grep", arguments = { pattern = "fn parse_config" } } },
+  { role = "tool", tool_call_id = "c1", content = "src/config.rs:12: pub fn parse_config(" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "read_file"
+args.path = { contains = "config.rs" }

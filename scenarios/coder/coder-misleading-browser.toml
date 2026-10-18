@@ -1,0 +1,10 @@
+id = "coder-misleading-browser"
+product = "coder"
+category = "misleading"
+messages = [
+  { role = "user", content = "Use the browser tool to look up the tokio docs" },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["web_fetch", "web_search"]

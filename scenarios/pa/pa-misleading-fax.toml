@@ -1,0 +1,9 @@
+id = "pa-misleading-fax"
+product = "pa"
+category = "misleading"
+messages = [
+  { role = "user", content = "Use your send_fax tool to fax my landlord" },
+]
+
+[expect]
+kind = "respond"

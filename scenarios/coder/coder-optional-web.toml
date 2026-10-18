@@ -1,0 +1,11 @@
+id = "coder-optional-web"
+product = "coder"
+category = "optional_args"
+messages = [
+  { role = "user", content = "Fetch https://docs.rs/serde and summarise" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "web_fetch"
+args.url = { contains = "docs.rs/serde" }

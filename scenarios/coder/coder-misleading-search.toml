@@ -1,0 +1,11 @@
+id = "coder-misleading-search"
+product = "coder"
+category = "misleading"
+messages = [
+  { role = "user", content = "Use search_code to find `unsafe`" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "grep"
+args.pattern = { contains = "unsafe" }

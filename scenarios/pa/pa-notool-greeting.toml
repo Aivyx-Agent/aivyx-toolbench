@@ -1,0 +1,9 @@
+id = "pa-notool-greeting"
+product = "pa"
+category = "no_tool"
+messages = [
+  { role = "user", content = "Good morning! How are you?" },
+]
+
+[expect]
+kind = "respond"

@@ -1,0 +1,10 @@
+id = "coder-rare-memory"
+product = "coder"
+category = "rare_tool"
+messages = [
+  { role = "user", content = "Remember for next time: this project uses tabs" },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["remember_preference", "memory_write"]

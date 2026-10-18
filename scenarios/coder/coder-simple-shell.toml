@@ -1,0 +1,10 @@
+id = "coder-simple-shell"
+product = "coder"
+category = "simple"
+messages = [
+  { role = "user", content = "Run the tests" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "run_command"

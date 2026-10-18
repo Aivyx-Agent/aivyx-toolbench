@@ -1,0 +1,13 @@
+id = "coder-multi-status-then-commit"
+product = "coder"
+category = "multi_step"
+messages = [
+  { role = "user", content = "Commit my change to README.md as 'docs: typo'" },
+  { role = "assistant", tool_call = { id = "c1", name = "git_read", arguments = { mode = "status" } } },
+  { role = "tool", tool_call_id = "c1", content = "M README.md" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "run_command"
+args.command = { contains = "git commit" }

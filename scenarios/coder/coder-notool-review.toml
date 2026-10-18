@@ -1,0 +1,9 @@
+id = "coder-notool-review"
+product = "coder"
+category = "no_tool"
+messages = [
+  { role = "user", content = "Is `let x = 5;` valid Rust?" },
+]
+
+[expect]
+kind = "respond"

@@ -1,0 +1,14 @@
+id = "pa-multi-read-then-write"
+product = "pa"
+category = "multi_step"
+messages = [
+  { role = "user", content = "Copy ~/a.md to ~/b.md" },
+  { role = "assistant", tool_call = { id = "c1", name = "fs.read", arguments = { path = "~/a.md" } } },
+  { role = "tool", tool_call_id = "c1", content = "Hello from a" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "fs.write"
+args.path = { contains = "b.md" }
+args.content = { contains = "Hello from a" }

@@ -1,0 +1,13 @@
+id = "pa-multi-search-then-read"
+product = "pa"
+category = "multi_step"
+messages = [
+  { role = "user", content = "Find my notes about taxes and open the first one" },
+  { role = "assistant", tool_call = { id = "c1", name = "memory.search", arguments = { query = "taxes" } } },
+  { role = "tool", tool_call_id = "c1", content = "1. ~/notes/taxes-2026.md" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "fs.read"
+args.path = { contains = "taxes-2026.md" }

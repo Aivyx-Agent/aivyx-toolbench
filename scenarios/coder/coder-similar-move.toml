@@ -1,0 +1,10 @@
+id = "coder-similar-move"
+product = "coder"
+category = "similar_tools"
+messages = [
+  { role = "user", content = "Rename src/util.rs to src/helpers.rs" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "move_file"

@@ -1,0 +1,11 @@
+id = "coder-required-delete"
+product = "coder"
+category = "required_args"
+messages = [
+  { role = "user", content = "Delete the file tmp/old.txt" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "delete_file"
+args.path = { contains = "old.txt" }

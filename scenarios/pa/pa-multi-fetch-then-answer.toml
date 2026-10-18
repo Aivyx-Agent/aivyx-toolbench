@@ -1,0 +1,11 @@
+id = "pa-multi-fetch-then-answer"
+product = "pa"
+category = "multi_step"
+messages = [
+  { role = "user", content = "What's the title of https://example.com?" },
+  { role = "assistant", tool_call = { id = "c1", name = "web.fetch", arguments = { url = "https://example.com" } } },
+  { role = "tool", tool_call_id = "c1", content = "<title>Example Domain</title>" },
+]
+
+[expect]
+kind = "respond"

@@ -1,0 +1,11 @@
+id = "coder-similar-write"
+product = "coder"
+category = "similar_tools"
+messages = [
+  { role = "user", content = "Create a new file docs/notes.md that says 'TODO'" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "write_file"
+args.path = { contains = "notes.md" }

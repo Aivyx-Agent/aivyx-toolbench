@@ -1,0 +1,11 @@
+id = "pa-required-dns"
+product = "pa"
+category = "required_args"
+messages = [
+  { role = "user", content = "What IP does example.org resolve to?" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "net.dns"
+args.host = { contains = "example.org" }

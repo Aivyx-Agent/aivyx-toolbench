@@ -1,0 +1,10 @@
+id = "coder-rare-references"
+product = "coder"
+category = "rare_tool"
+messages = [
+  { role = "user", content = "Who calls `load_settings`? Use the language server." },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["find_references", "grep"]

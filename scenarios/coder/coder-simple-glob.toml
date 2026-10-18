@@ -1,0 +1,11 @@
+id = "coder-simple-glob"
+product = "coder"
+category = "simple"
+messages = [
+  { role = "user", content = "List all the TOML files in the project" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "glob"
+args.pattern = { contains = "toml" }

@@ -1,0 +1,9 @@
+id = "pa-notool-explain"
+product = "pa"
+category = "no_tool"
+messages = [
+  { role = "user", content = "In one sentence, what is DNS?" },
+]
+
+[expect]
+kind = "respond"

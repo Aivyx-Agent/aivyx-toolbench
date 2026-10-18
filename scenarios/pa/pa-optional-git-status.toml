@@ -1,0 +1,11 @@
+id = "pa-optional-git-status"
+product = "pa"
+category = "optional_args"
+messages = [
+  { role = "user", content = "Is my repo clean?" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "shell.exec"
+args.cmd = { contains = "git status" }

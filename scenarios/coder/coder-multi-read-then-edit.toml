@@ -1,0 +1,12 @@
+id = "coder-multi-read-then-edit"
+product = "coder"
+category = "multi_step"
+messages = [
+  { role = "user", content = "Bump the version in Cargo.toml to 0.2.0" },
+  { role = "assistant", tool_call = { id = "c1", name = "read_file", arguments = { path = "Cargo.toml" } } },
+  { role = "tool", tool_call_id = "c1", content = "[package]\nname = \"demo\"\nversion = \"0.1.0\"" },
+]
+
+[expect]
+kind = "tool_call"
+any_of = ["edit_file", "patch_file"]

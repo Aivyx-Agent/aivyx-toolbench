@@ -1,0 +1,10 @@
+id = "pa-rare-workspace-list"
+product = "pa"
+category = "rare_tool"
+messages = [
+  { role = "user", content = "List what's in your own workspace" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "workspace.list"

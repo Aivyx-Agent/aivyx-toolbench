@@ -1,0 +1,11 @@
+id = "pa-similar-metadata"
+product = "pa"
+category = "similar_tools"
+messages = [
+  { role = "user", content = "How big is ~/notes/big.log? Don't open it." },
+]
+
+[expect]
+kind = "tool_call"
+tool = "fs.metadata"
+args.path = { contains = "big.log" }

@@ -1,0 +1,9 @@
+id = "pa-misleading-email"
+product = "pa"
+category = "misleading"
+messages = [
+  { role = "user", content = "Email my boss with the email.send tool" },
+]
+
+[expect]
+kind = "respond"

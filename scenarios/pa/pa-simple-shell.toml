@@ -1,0 +1,10 @@
+id = "pa-simple-shell"
+product = "pa"
+category = "simple"
+messages = [
+  { role = "user", content = "Run `ls -la` in my workspace" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "shell.exec"

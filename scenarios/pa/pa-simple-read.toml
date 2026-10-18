@@ -1,0 +1,11 @@
+id = "pa-simple-read"
+product = "pa"
+category = "simple"
+messages = [
+  { role = "user", content = "What's in ~/notes/todo.md?" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "fs.read"
+args.path = { contains = "todo.md" }

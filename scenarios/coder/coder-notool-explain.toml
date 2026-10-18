@@ -1,0 +1,9 @@
+id = "coder-notool-explain"
+product = "coder"
+category = "no_tool"
+messages = [
+  { role = "user", content = "What's the difference between a Vec and a slice?" },
+]
+
+[expect]
+kind = "respond"

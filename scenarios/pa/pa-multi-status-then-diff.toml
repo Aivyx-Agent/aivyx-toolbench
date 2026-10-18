@@ -1,0 +1,13 @@
+id = "pa-multi-status-then-diff"
+product = "pa"
+category = "multi_step"
+messages = [
+  { role = "user", content = "Anything uncommitted? If so show me" },
+  { role = "assistant", tool_call = { id = "c1", name = "shell.exec", arguments = { cmd = "git", args = ["status", "--short"] } } },
+  { role = "tool", tool_call_id = "c1", content = "M src/main.rs" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "shell.exec"
+args.cmd = { contains = "git" }
