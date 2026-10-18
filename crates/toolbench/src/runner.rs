@@ -39,8 +39,7 @@ pub async fn run_endpoint(
 ) -> Result<RunSummary> {
     let client = reqwest::Client::new();
     let models = reachable(&client, ep).await?;
-    let run_id = crate::util::new_run_id();
-    let (started_at, _) = crate::util::utc_now();
+    let (run_id, started_at) = crate::util::new_run_stamp();
     let scenarios_json = serde_json::to_vec(scenarios)?;
     let header = RunHeader {
         run_id: run_id.clone(),
@@ -165,6 +164,16 @@ fn reply_for(mode: Mode, body: Option<&serde_json::Value>, error: Option<&str>) 
             reason: "no response body".into(),
         },
     }
+}
+
+/// `rescore` of one stored file, read as written: a legacy input stays
+/// legacy (no header, no run ids).
+pub fn rescore_file(
+    input: &std::path::Path,
+    scenarios: &[Scenario],
+    snapshots: &BTreeMap<String, Snapshot>,
+) -> Result<Vec<Line>> {
+    rescore(&crate::result::read_lines(input)?, scenarios, snapshots)
 }
 
 /// Re-applies parsing and checks to stored lines with the current
@@ -485,10 +494,23 @@ tool = "fs.read"
     }
 
     #[test]
-    fn rescoring_a_legacy_input_adds_no_header() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../results/2026-10-18/llama-native.jsonl");
-        let lines = crate::result::read_lines(&path).unwrap();
-        assert!(lines.iter().all(|l| !matches!(l, Line::Run(_))));
+    fn rescoring_a_legacy_input_leaves_it_legacy() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let snaps = crate::snapshot::load_dir(&root.join("fixtures/tools")).unwrap();
+        let scs = crate::scenario::load_dir(&root.join("scenarios"), &snaps).unwrap();
+        let out = rescore_file(
+            &root.join("results/2026-10-18/llama-native.jsonl"),
+            &scs,
+            &snaps,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 300);
+        for l in &out {
+            match l {
+                Line::Reply(r) => assert_eq!(r.run_id, None),
+                Line::EndpointStatus(s) => assert_eq!(s.run_id, None),
+                other => panic!("legacy rescore output gained {other:?}"),
+            }
+        }
     }
 }

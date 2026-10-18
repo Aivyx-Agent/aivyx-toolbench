@@ -1,6 +1,6 @@
 //! Aggregation, the pre-agreed verdict, and the Markdown report.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use crate::bootstrap::paired_ci;
@@ -43,6 +43,8 @@ pub struct Stats {
     /// `None` without a header (legacy), `Some(true)` once a `run_end` line
     /// is seen, `Some(false)` for a header with no `run_end` (killed mid-run).
     pub complete: Option<bool>,
+    /// The largest `replies` count among the run's `run_end` lines.
+    pub end_replies: Option<usize>,
     pub endpoint: String,
     pub model: String,
     pub mode: Mode,
@@ -93,6 +95,7 @@ impl Stats {
             order,
             temperature: Temperature::Unknown,
             complete: None,
+            end_replies: None,
             endpoint: endpoint.into(),
             model: model.into(),
             mode,
@@ -115,6 +118,11 @@ impl Stats {
             scen_args: BTreeMap::new(),
             flaky: Vec::new(),
         }
+    }
+    /// More replies than the run's `run_end` reported: the input holds the
+    /// run more than once (e.g. a file concatenated with its copy).
+    pub fn duplicated(&self) -> bool {
+        self.end_replies.is_some_and(|n| self.replies > n)
     }
     pub fn valid_rate(&self) -> Option<f64> {
         rate(self.valid_num, self.valid_den)
@@ -160,7 +168,7 @@ pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
     let mut out: BTreeMap<String, Stats> = BTreeMap::new();
     let mut runs_by: BTreeMap<(String, String), Vec<RunOutcome>> = BTreeMap::new();
     let mut saw_status: Vec<String> = Vec::new();
-    let mut ended: BTreeSet<String> = BTreeSet::new();
+    let mut ended: BTreeMap<String, usize> = BTreeMap::new();
     let key_of = |run_id: &Option<String>, endpoint: &str, model: &str| {
         run_id
             .clone()
@@ -192,7 +200,8 @@ pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
                 st.complete = Some(false);
             }
             Line::RunEnd(e) => {
-                ended.insert(e.run_id.clone());
+                let n = ended.entry(e.run_id.clone()).or_default();
+                *n = (*n).max(e.replies);
             }
             Line::Reply(r) => {
                 let key = key_of(&r.run_id, &r.endpoint, &r.model);
@@ -263,8 +272,9 @@ pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
     }
     for st in out.values_mut() {
         if st.complete.is_some() {
-            st.complete = Some(ended.contains(&st.run_id));
+            st.complete = Some(ended.contains_key(&st.run_id));
         }
+        st.end_replies = ended.get(&st.run_id).copied();
     }
     out
 }
@@ -384,6 +394,15 @@ fn incomplete_note(s: &Stats, notes: &mut Vec<String>) {
     }
 }
 
+fn duplicate_note(s: &Stats, notes: &mut Vec<String>) {
+    if let Some(n) = s.end_replies.filter(|_| s.duplicated()) {
+        notes.push(format!(
+            "run `{}` of `{}` has {} replies but its run_end says {n} (duplicated input?)",
+            s.run_id, s.endpoint, s.replies
+        ));
+    }
+}
+
 pub fn assess(
     stats: &BTreeMap<String, Stats>,
     cfg: &VerdictConfig,
@@ -431,6 +450,7 @@ fn decide(
         return Verdict::Undecided(format!("no usable results for baseline `{}`", cfg.baseline));
     };
     incomplete_note(base, notes);
+    duplicate_note(base, notes);
     let (Some(bv), Some(bc)) = (base.valid_rate(), base.choice_rate()) else {
         return Verdict::Undecided("baseline has no rates".into());
     };
@@ -439,6 +459,7 @@ fn decide(
         [] => None,
         [one] => {
             incomplete_note(one, notes);
+            duplicate_note(one, notes);
             if one.temperature != base.temperature
                 || one.temperature == Temperature::Unknown
                 || base.temperature == Temperature::Unknown
@@ -593,13 +614,17 @@ fn decide(
                     others.push(format!("{label} {} vs {}", pct(b), pct(a)));
                 }
             }
-            build.push(format!(
-                "{} beats {} {}, at comparable median speed; {}",
+            let mut reason = format!(
+                "{} beats {} {}, at comparable median speed",
                 cfg.challenger,
                 cfg.baseline,
-                beats.join(" and "),
-                others.join(", ")
-            ));
+                beats.join(" and ")
+            );
+            if !others.is_empty() {
+                reason.push_str("; ");
+                reason.push_str(&others.join(", "));
+            }
+            build.push(reason);
         } else if edge {
             keep.push(format!(
                 "{} is better ({} / {}) but more than 20 % slower",
@@ -643,6 +668,9 @@ fn run_cell(s: &Stats) -> String {
     let mut out = cell(&s.run_id);
     if s.complete == Some(false) {
         out.push_str(" (incomplete)");
+    }
+    if s.duplicated() {
+        out.push_str(" (duplicated?)");
     }
     out
 }
@@ -1125,11 +1153,11 @@ mod tests {
         })
     }
 
-    fn run_end(run_id: &str) -> Line {
+    fn run_end(run_id: &str, replies: usize) -> Line {
         Line::RunEnd(crate::result::RunEnd {
             run_id: run_id.into(),
             fingerprint: None,
-            replies: 0,
+            replies,
         })
     }
 
@@ -1139,9 +1167,10 @@ mod tests {
             Line::Reply(r) => r.endpoint.clone(),
             _ => unreachable!(),
         };
+        let n = ls.iter().filter(|l| matches!(l, Line::Reply(_))).count();
         let mut out = vec![header(run_id, &endpoint, started_at, temp)];
         out.extend(tagged(ls, run_id));
-        out.push(run_end(run_id));
+        out.push(run_end(run_id, n));
         out
     }
 
@@ -1564,6 +1593,54 @@ mod tests {
         assert!(md.contains("| b1 (incomplete) |"), "{md}");
         assert!(md.contains("| c1 |"), "{md}");
         assert!(md.contains("- run `b1` of `base` is incomplete"), "{md}");
+    }
+
+    #[test]
+    fn a_run_with_more_replies_than_its_end_line_is_flagged() {
+        let mut ls = run(
+            "b1",
+            "2026-10-19T08:00:00Z",
+            None,
+            lines("base", 100, 99, 1000),
+        );
+        // The same run concatenated twice into one file.
+        ls.extend(ls.clone());
+        ls.extend(run(
+            "c1",
+            "2026-10-19T08:00:00Z",
+            None,
+            lines("chal", 100, 100, 1000),
+        ));
+        let s = aggregate(&ls);
+        assert_eq!(s["b1"].replies, 200);
+        assert!(s["b1"].duplicated() && !s["c1"].duplicated());
+        let a = assess(&s, &cfg(), &RunSelection::default());
+        assert_eq!(
+            a.notes,
+            ["run `b1` of `base` has 200 replies but its run_end says 100 (duplicated input?)"],
+            "{a:?}"
+        );
+        let md = render(&s, Some(&a));
+        assert!(md.contains("| b1 (duplicated?) |"), "{md}");
+        assert!(md.contains("| c1 |"), "{md}");
+    }
+
+    #[test]
+    fn a_build_reason_with_both_edges_has_no_dangling_separator() {
+        // 90 % valid and 90 % choice against a perfect challenger: both fire.
+        let s = stats(vec![
+            lines("base", 100, 90, 1000),
+            lines("chal", 100, 100, 1000),
+        ]);
+        let Verdict::Build(r) = verdict(&s, &cfg(), &RunSelection::default()) else {
+            panic!()
+        };
+        let reason = r.iter().find(|x| x.contains("chal beats base")).unwrap();
+        assert!(
+            reason.contains("on valid call") && reason.contains("and on correct choice"),
+            "{reason}"
+        );
+        assert!(reason.ends_with("at comparable median speed"), "{reason:?}");
     }
 
     #[test]

@@ -174,7 +174,7 @@ async fn main() -> Result<()> {
         } => {
             let snaps = snapshot::load_dir(&snapshots)?;
             let scs = scenario::load_dir(&scenarios, &snaps)?;
-            let lines = runner::rescore(&result::read_lines_tagged(&input)?, &scs, &snaps)?;
+            let lines = runner::rescore_file(&input, &scs, &snaps)?;
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -191,10 +191,7 @@ async fn main() -> Result<()> {
             latest,
         } => {
             let cfg = config::Config::load(&config)?;
-            let mut lines = Vec::new();
-            for path in &inputs {
-                lines.extend(result::read_lines_tagged(path)?);
-            }
+            let lines = result::read_inputs(&inputs)?;
             let stats = report::aggregate(&lines);
             let sel = selection(picks, latest)?;
             let assessment = cfg

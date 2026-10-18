@@ -38,6 +38,8 @@ snapshots and scenarios, and the models the server reports. Every reply and
 status line carries that `run_id`, and a closing `run_end` line marks the run as
 complete; a header with no `run_end` is shown as incomplete. Files written
 before headers existed have none and are read as `legacy:<file stem>` runs.
+Run headers include the endpoint's `base_url` and the server's model list:
+check them (privacy grep) before committing results.
 
 ### Report
 

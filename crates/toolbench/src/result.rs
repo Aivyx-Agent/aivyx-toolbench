@@ -1,8 +1,8 @@
 //! One JSONL line per reply (or per endpoint status).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -124,26 +124,83 @@ pub fn read_lines(path: &Path) -> Result<Vec<Line>> {
     Ok(out)
 }
 
-/// Like `read_lines`, but a reply or status line without a `run_id` (a file
-/// written before run headers existed) is tagged `legacy:<file stem>`, so each
-/// such file is one run.
-pub fn read_lines_tagged(path: &Path) -> Result<Vec<Line>> {
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let legacy = format!("legacy:{stem}");
-    Ok(read_lines(path)?
-        .into_iter()
-        .map(|mut line| {
-            match &mut line {
-                Line::Reply(r) if r.run_id.is_none() => r.run_id = Some(legacy.clone()),
-                Line::EndpointStatus(s) if s.run_id.is_none() => s.run_id = Some(legacy.clone()),
-                _ => {}
+/// The `run_id` a line carries, if any.
+fn line_run_id(line: &Line) -> Option<&str> {
+    match line {
+        Line::Reply(r) => r.run_id.as_deref(),
+        Line::EndpointStatus(s) => s.run_id.as_deref(),
+        Line::Run(h) => Some(&h.run_id),
+        Line::RunEnd(e) => Some(&e.run_id),
+    }
+}
+
+/// `legacy:<stem>`, or, when an earlier input already took that,
+/// `legacy:<parent dir>/<stem>`, then `legacy:<parent dir>/<stem>#2`, ...
+fn legacy_id(path: &Path, used: &BTreeSet<String>) -> String {
+    let name = |p: Option<&std::ffi::OsStr>| {
+        p.map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let stem = name(path.file_stem());
+    let plain = format!("legacy:{stem}");
+    if !used.contains(&plain) {
+        return plain;
+    }
+    let parent = name(path.parent().and_then(Path::file_name));
+    let long = format!("legacy:{parent}/{stem}");
+    if !used.contains(&long) {
+        return long;
+    }
+    (2..)
+        .map(|n| format!("{long}#{n}"))
+        .find(|id| !used.contains(id))
+        .expect("an unused suffix exists")
+}
+
+/// Reads every input for `report`. A reply or status line without a
+/// `run_id` (a file written before run headers existed) is tagged with its
+/// file's legacy id (see `legacy_id`), so each such file is one run. A
+/// headered `run_id` found in two inputs is an error: the same run would
+/// otherwise be counted twice.
+pub fn read_inputs(paths: &[PathBuf]) -> Result<Vec<Line>> {
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    let mut seen: BTreeMap<String, &Path> = BTreeMap::new();
+    let mut out = Vec::new();
+    for path in paths {
+        let mut lines = read_lines(path)?;
+        let ids: BTreeSet<String> = lines
+            .iter()
+            .filter_map(line_run_id)
+            .map(str::to_string)
+            .collect();
+        for id in ids {
+            if let Some(prev) = seen.get(&id) {
+                anyhow::bail!(
+                    "run `{id}` appears in {} and {} (a rescored copy?); pass only one",
+                    prev.display(),
+                    path.display()
+                );
             }
-            line
-        })
-        .collect())
+            seen.insert(id, path);
+        }
+        if lines.iter().any(|l| {
+            matches!(l, Line::Reply(_) | Line::EndpointStatus(_)) && line_run_id(l).is_none()
+        }) {
+            let legacy = legacy_id(path, &used);
+            for line in &mut lines {
+                match line {
+                    Line::Reply(r) if r.run_id.is_none() => r.run_id = Some(legacy.clone()),
+                    Line::EndpointStatus(s) if s.run_id.is_none() => {
+                        s.run_id = Some(legacy.clone())
+                    }
+                    _ => {}
+                }
+            }
+            used.insert(legacy);
+        }
+        out.extend(lines);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -157,7 +214,7 @@ mod tests {
     fn a_legacy_file_reads_with_every_line_tagged_by_its_stem() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../results/2026-10-18/llama-native.jsonl");
-        let lines = read_lines_tagged(&path).unwrap();
+        let lines = read_inputs(&[path]).unwrap();
         let replies: Vec<_> = lines
             .iter()
             .filter_map(|l| match l {
@@ -171,6 +228,93 @@ mod tests {
                 .iter()
                 .all(|r| r.run_id.as_deref() == Some("legacy:llama-native"))
         );
+    }
+
+    fn ids(lines: &[Line]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for l in lines {
+            let id = match l {
+                Line::Reply(r) => r.run_id.clone(),
+                Line::EndpointStatus(s) => s.run_id.clone(),
+                Line::Run(h) => Some(h.run_id.clone()),
+                Line::RunEnd(e) => Some(e.run_id.clone()),
+            };
+            if let Some(id) = id
+                && !out.contains(&id)
+            {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    fn results(rel: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../results")
+            .join(rel)
+    }
+
+    #[test]
+    fn legacy_files_sharing_a_stem_get_distinct_ids() {
+        let a = results("2026-10-18/llama-grammar.jsonl");
+        let b = results("2026-10-18-name-first/llama-grammar.jsonl");
+        let lines = read_inputs(&[a.clone(), b.clone(), a.clone()]).unwrap();
+        assert_eq!(
+            ids(&lines),
+            [
+                "legacy:llama-grammar",
+                "legacy:2026-10-18-name-first/llama-grammar",
+                "legacy:2026-10-18/llama-grammar",
+            ]
+        );
+        let again = read_inputs(&[a.clone(), a.clone(), a]).unwrap();
+        assert_eq!(
+            ids(&again),
+            [
+                "legacy:llama-grammar",
+                "legacy:2026-10-18/llama-grammar",
+                "legacy:2026-10-18/llama-grammar#2",
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_ids_without_a_collision_are_the_plain_stem() {
+        let lines = read_inputs(&[
+            results("2026-10-18/llama-native.jsonl"),
+            results("2026-10-18-name-first/llama-grammar.jsonl"),
+        ])
+        .unwrap();
+        assert_eq!(ids(&lines), ["legacy:llama-native", "legacy:llama-grammar"]);
+    }
+
+    #[test]
+    fn a_headered_run_in_two_files_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("toolbench-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let end = Line::RunEnd(RunEnd {
+            run_id: "20261019T081502Z-abcd".into(),
+            fingerprint: None,
+            replies: 0,
+        });
+        let (a, b) = (dir.join("a.jsonl"), dir.join("b.jsonl"));
+        for p in [&a, &b] {
+            let mut f = std::fs::File::create(p).unwrap();
+            write_line(&mut f, &end).unwrap();
+        }
+        let err = read_inputs(&[a.clone(), b.clone()])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "run `20261019T081502Z-abcd` appears in {} and {} (a rescored copy?); pass only one",
+                a.display(),
+                b.display()
+            )
+        );
+        assert!(read_inputs(&[a]).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

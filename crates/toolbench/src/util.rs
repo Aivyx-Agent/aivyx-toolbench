@@ -39,14 +39,6 @@ pub fn utc_strings(secs: u64) -> (String, String) {
     )
 }
 
-pub fn utc_now() -> (String, String) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    utc_strings(secs)
-}
-
 /// splitmix64: tiny, deterministic, good enough for resampling.
 pub struct SplitMix64(u64);
 
@@ -67,14 +59,22 @@ impl SplitMix64 {
     }
 }
 
-/// `YYYYMMDDTHHMMSSZ-xxxx`.
-pub fn new_run_id() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+/// (`run_id` `YYYYMMDDTHHMMSSZ-xxxx`, `started_at` RFC 3339) for one instant,
+/// so the two never disagree across a second boundary.
+pub fn new_run_stamp_at(now: std::time::Duration) -> (String, String) {
     let seed = now.as_nanos() as u64 ^ (u64::from(std::process::id()) << 32);
     let hex = SplitMix64::new(seed).next_u64() & 0xffff;
-    format!("{}-{hex:04x}", utc_strings(now.as_secs()).1)
+    let (rfc, compact) = utc_strings(now.as_secs());
+    (format!("{compact}-{hex:04x}"), rfc)
+}
+
+/// `new_run_stamp_at` for the current time.
+pub fn new_run_stamp() -> (String, String) {
+    new_run_stamp_at(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -128,9 +128,23 @@ mod tests {
 
     #[test]
     fn run_ids_have_the_documented_shape() {
-        let id = new_run_id();
+        let (id, _) = new_run_stamp();
         let re = regex::Regex::new(r"^\d{8}T\d{6}Z-[0-9a-f]{4}$").unwrap();
         assert!(re.is_match(&id), "{id}");
+    }
+
+    #[test]
+    fn run_id_and_started_at_come_from_one_instant() {
+        let now = std::time::Duration::new(1_792_313_735, 999_999_999);
+        let (id, started_at) = new_run_stamp_at(now);
+        assert!(id.starts_with("20261018T085535Z-"), "{id}");
+        assert_eq!(started_at, "2026-10-18T08:55:35Z");
+        let (id, started_at) = new_run_stamp();
+        assert_eq!(
+            id[..16],
+            started_at.replace(['-', ':'], ""),
+            "{id} vs {started_at}"
+        );
     }
 
     #[test]

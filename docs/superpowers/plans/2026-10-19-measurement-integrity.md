@@ -1135,7 +1135,7 @@ Then state that the native lead is outside the noise, if its CI's `lo` > 0.
 git add results && git commit -s -m "results: regenerated reports with CIs; DECISION corrects a within-noise claim" -m "Co-Authored-By: …"
 ```
 
-In `/home/julian/Projects/Rust/aivyx-ecosystem/ROADMAP.md`'s 2026-10-18
+In the sibling repo `aivyx-ecosystem/ROADMAP.md`'s 2026-10-18
 entry, change "and mistral.rs from 37.0 % to 72.0 % correct choice" to add
 "(within noise of llama-server's 76.7 %)", and add one sentence on the CIs.
 Commit there (`-s` not needed; that repo doesn't use DCO).
@@ -1143,7 +1143,7 @@ Commit there (`-s` not needed; that repo doesn't use DCO).
 - [ ] **Step 4: Privacy grep before pushing**
 
 ```bash
-grep -rn -E '/home/julian|julian|@gmail|@proton' results/ README.md || echo CLEAN
+grep -rnE "$HOME|$USER|@gmail|@proton" results/ README.md || echo CLEAN
 ```
 
 Push toolbench. Ask the user before pushing aivyx-ecosystem.
