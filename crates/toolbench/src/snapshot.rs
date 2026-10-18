@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn coder_snapshot_grammar_compiles() {
+    fn captured_snapshot_grammars_compile() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tools");
         for f in ["coder.json", "pa.json"] {
             let text = std::fs::read_to_string(dir.join(f)).unwrap();

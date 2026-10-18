@@ -53,6 +53,8 @@
 //! real Aivyx tool is `namespace.action` — so it can never collide
 //! with a registered tool.
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 use serde::{Deserialize, Serialize};
@@ -89,22 +91,25 @@ pub fn tool_call_grammar(tools: &[ToolSpec]) -> Value {
     for t in tools {
         let mut schema = t.input_schema.clone();
         if let Some(obj) = schema.as_object_mut() {
-            let mut defs: Vec<(String, Value)> = Vec::new();
-            for key in ["$defs", "definitions"] {
+            let mut defs: Vec<(&'static str, String, Value)> = Vec::new();
+            for (key, ns) in [("$defs", "$defs"), ("definitions", "definitions")] {
                 if let Some(Value::Object(m)) = obj.remove(key) {
-                    defs.extend(m);
+                    defs.extend(m.into_iter().map(|(n, d)| (ns, n, d)));
                 }
             }
             if !defs.is_empty() {
                 let tool = sanitize_tool_name(&t.name);
-                let renames: std::collections::HashMap<&str, String> = defs
-                    .iter()
-                    .map(|(n, _)| (n.as_str(), unique_def_key(&tool, n, &hoisted)))
-                    .collect();
+                let mut renames: RefRenames = HashMap::new();
+                for (ns, n, _) in &defs {
+                    let key = unique_def_key(&tool, n, &hoisted);
+                    // Reserve the key now so later defs cannot reuse it.
+                    hoisted.insert(key.clone(), Value::Null);
+                    renames.insert((ns, n.clone()), key);
+                }
                 rewrite_refs(&mut schema, &renames);
-                for (n, mut d) in defs.clone() {
+                for (ns, n, mut d) in defs {
                     rewrite_refs(&mut d, &renames);
-                    hoisted.insert(renames[n.as_str()].clone(), d);
+                    hoisted.insert(renames[&(ns, n)].clone(), d);
                 }
             }
         }
@@ -117,6 +122,9 @@ pub fn tool_call_grammar(tools: &[ToolSpec]) -> Value {
     }
     grammar
 }
+
+/// (namespace, def name) -> new hoisted key.
+type RefRenames = HashMap<(&'static str, String), String>;
 
 /// Sanitised tool name used as the `$defs` key prefix.
 fn sanitize_tool_name(name: &str) -> String {
@@ -145,7 +153,7 @@ fn unique_def_key(tool: &str, def: &str, taken: &serde_json::Map<String, Value>)
 
 /// Recursively rewrite local `#/$defs/<n>` / `#/definitions/<n>` refs
 /// whose `<n>` is in `renames` to `#/$defs/<escaped new key>`.
-fn rewrite_refs(v: &mut Value, renames: &std::collections::HashMap<&str, String>) {
+fn rewrite_refs(v: &mut Value, renames: &RefRenames) {
     match v {
         Value::Object(m) => {
             for (k, val) in m.iter_mut() {
@@ -154,10 +162,11 @@ fn rewrite_refs(v: &mut Value, renames: &std::collections::HashMap<&str, String>
                 {
                     let name = r
                         .strip_prefix("#/$defs/")
-                        .or_else(|| r.strip_prefix("#/definitions/"));
-                    if let Some(name) = name {
+                        .map(|n| ("$defs", n))
+                        .or_else(|| r.strip_prefix("#/definitions/").map(|n| ("definitions", n)));
+                    if let Some((ns, name)) = name {
                         let name = name.replace("~1", "/").replace("~0", "~");
-                        if let Some(new) = renames.get(name.as_str()) {
+                        if let Some(new) = renames.get(&(ns, name)) {
                             *r = format!("#/$defs/{}", new.replace('~', "~0").replace('/', "~1"));
                         }
                     }
@@ -632,5 +641,24 @@ mod tests {
         let v = validator_for(&[t]);
         assert!(v.is_valid(&call("t", json!({"o": {"i": "s"}}))));
         assert!(!v.is_valid(&call("t", json!({"o": {"i": 1}}))));
+    }
+
+    #[test]
+    fn defs_and_definitions_with_one_name_stay_separate() {
+        let t = tool(
+            "t",
+            json!({
+                "type": "object",
+                "properties": { "a": { "$ref": "#/$defs/X" },
+                                "b": { "$ref": "#/definitions/X" } },
+                "required": ["a", "b"],
+                "$defs": { "X": { "type": "string" } },
+                "definitions": { "X": { "type": "integer" } },
+            }),
+        );
+        let v = validator_for(&[t]);
+        assert!(v.is_valid(&call("t", json!({"a": "s", "b": 1}))));
+        assert!(!v.is_valid(&call("t", json!({"a": 1, "b": 1}))));
+        assert!(!v.is_valid(&call("t", json!({"a": "s", "b": "s"}))));
     }
 }
