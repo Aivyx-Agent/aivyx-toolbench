@@ -1,4 +1,4 @@
-//! Tool-call grammar generation — Chapter Stencil (ST.1).
+//! aivyx-stencil — grammar-constrained tool calls (Chapter Stencil / Emboss, extracted from aivyx-pa).
 //!
 //! Grammar-constrained decoding forces a local model to emit a
 //! **valid, real-named tool call by construction** instead of
@@ -7,7 +7,7 @@
 //! a well-formed call — the constraint a provider then hands to
 //! its decoder (for `mistralrs`, `Constraint::JsonSchema`).
 //!
-//! The function is **pure and provider-agnostic**: `&[LlmToolDescriptor]`
+//! The function is **pure and provider-agnostic**: `&[ToolSpec]`
 //! in, [`serde_json::Value`] out, no engine, no I/O. It lives at
 //! the crate root (not under `mistral_rs/`) precisely so a future
 //! `llama-server` `/completion` GBNF path can reuse it unchanged.
@@ -53,9 +53,21 @@
 //! real Aivyx tool is `namespace.action` — so it can never collide
 //! with a registered tool.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::LlmToolDescriptor;
+use serde::{Deserialize, Serialize};
+
+/// One tool as a model sees it: the shape every product's tool list
+/// converts to (aivyx-pa's `LlmToolDescriptor`, aivyx-coder's
+/// `ToolDefinition`). `input_schema` is the tool's JSON Schema for its
+/// arguments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
 
 /// Reserved pseudo-tool name the grammar admits so a constrained
 /// model can decline to call a real tool and reply in plain text.
@@ -71,7 +83,7 @@ pub const RESPOND_SENTINEL: &str = "respond";
 /// generation constraint. With an empty `tools` slice the grammar
 /// still admits the sentinel, so a constrained turn can always
 /// produce *something* well-formed.
-pub fn tool_call_grammar(tools: &[LlmToolDescriptor]) -> Value {
+pub fn tool_call_grammar(tools: &[ToolSpec]) -> Value {
     let mut branches: Vec<Value> = tools
         .iter()
         .map(|t| tool_branch(&t.name, &t.input_schema))
@@ -166,10 +178,7 @@ pub fn system_message_for(base: Option<&str>, constrain: bool) -> Option<String>
 /// other name to a real tool call.
 #[derive(Debug, PartialEq)]
 pub enum ConstrainedOutput {
-    ToolCall {
-        tool_name: String,
-        input: Value,
-    },
+    ToolCall { tool_name: String, input: Value },
     Text(String),
 }
 
@@ -180,10 +189,7 @@ pub enum ConstrainedOutput {
 pub fn parse_constrained_output(content: &str) -> Option<ConstrainedOutput> {
     let value: Value = serde_json::from_str(content.trim()).ok()?;
     let name = value.get("name")?.as_str()?;
-    let arguments = value
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let arguments = value.get("arguments").cloned().unwrap_or_else(|| json!({}));
     if name == RESPOND_SENTINEL {
         let text = arguments
             .get("text")
@@ -204,9 +210,9 @@ mod tests {
     use super::*;
 
     /// Two sample tools with realistic object input schemas.
-    fn sample_tools() -> Vec<LlmToolDescriptor> {
+    fn sample_tools() -> Vec<ToolSpec> {
         vec![
-            LlmToolDescriptor {
+            ToolSpec {
                 name: "fs.read".to_string(),
                 description: "Read a file".to_string(),
                 input_schema: json!({
@@ -216,7 +222,7 @@ mod tests {
                     "additionalProperties": false,
                 }),
             },
-            LlmToolDescriptor {
+            ToolSpec {
                 name: "web.fetch".to_string(),
                 description: "Fetch a URL".to_string(),
                 input_schema: json!({
@@ -232,7 +238,7 @@ mod tests {
     /// Compile the generated grammar into a validator. Asserts the
     /// grammar is itself a well-formed schema (the precondition for
     /// every other test).
-    fn validator_for(tools: &[LlmToolDescriptor]) -> jsonschema::Validator {
+    fn validator_for(tools: &[ToolSpec]) -> jsonschema::Validator {
         let grammar = tool_call_grammar(tools);
         jsonschema::validator_for(&grammar)
             .expect("tool_call_grammar must produce a valid JSON Schema")
@@ -328,10 +334,9 @@ mod tests {
 
     #[test]
     fn parse_constrained_real_tool_call() {
-        let out = parse_constrained_output(
-            r#"{"name": "fs.read", "arguments": {"path": "/etc/hosts"}}"#,
-        )
-        .expect("well-formed constrained call parses");
+        let out =
+            parse_constrained_output(r#"{"name": "fs.read", "arguments": {"path": "/etc/hosts"}}"#)
+                .expect("well-formed constrained call parses");
         assert_eq!(
             out,
             ConstrainedOutput::ToolCall {
@@ -343,10 +348,9 @@ mod tests {
 
     #[test]
     fn parse_constrained_respond_sentinel_unwraps_to_text() {
-        let out = parse_constrained_output(
-            r#"{"name": "respond", "arguments": {"text": "All done."}}"#,
-        )
-        .expect("sentinel parses");
+        let out =
+            parse_constrained_output(r#"{"name": "respond", "arguments": {"text": "All done."}}"#)
+                .expect("sentinel parses");
         assert_eq!(out, ConstrainedOutput::Text("All done.".to_string()));
     }
 
@@ -380,7 +384,10 @@ mod tests {
         // Constrained → the preamble is appended after the operator
         // prompt (appended, never replacing it).
         let got = system_message_for(Some("You are Aivyx."), true).unwrap();
-        assert!(got.starts_with("You are Aivyx."), "operator prompt preserved");
+        assert!(
+            got.starts_with("You are Aivyx."),
+            "operator prompt preserved"
+        );
         assert!(got.contains(RESPOND_PREAMBLE), "preamble present");
         assert!(got.contains(RESPOND_SENTINEL), "names the respond sentinel");
 
@@ -388,6 +395,19 @@ mod tests {
         assert_eq!(
             system_message_for(None, true).as_deref(),
             Some(RESPOND_PREAMBLE)
+        );
+    }
+
+    #[test]
+    fn tool_spec_round_trips_through_json() {
+        let spec = sample_tools().remove(0);
+        let text = serde_json::to_string(&spec).unwrap();
+        assert_eq!(serde_json::from_str::<ToolSpec>(&text).unwrap(), spec);
+        assert!(
+            serde_json::from_str::<ToolSpec>(
+                r#"{"name":"a","description":"","input_schema":{},"extra":1}"#
+            )
+            .is_err()
         );
     }
 }
