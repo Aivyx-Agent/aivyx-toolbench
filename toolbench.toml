@@ -1,0 +1,41 @@
+[[endpoint]]
+name = "llama-native"
+base_url = "http://127.0.0.1:8090/v1"
+model = "/models/Qwen3.5-9B-Q4_K_M.gguf"
+mode = "native"
+
+[[endpoint]]
+name = "llama-grammar"
+base_url = "http://127.0.0.1:8090/v1"
+model = "/models/Qwen3.5-9B-Q4_K_M.gguf"
+mode = "grammar"
+grammar_field = "json_schema"
+
+[[endpoint]]
+name = "mistralrs-grammar"
+base_url = "http://127.0.0.1:1234/v1"
+model = "default"
+mode = "grammar"
+grammar_field = "response_format"
+
+[[endpoint]]
+name = "ollama-native"
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3.5-9b-q4km"
+mode = "native"
+
+[[endpoint]]
+name = "llama-native-4b"
+base_url = "http://127.0.0.1:8091/v1"
+model = "/models/Qwen3-4B-Q4_K_M.gguf"
+mode = "native"
+
+[[endpoint]]
+name = "llama-grammar-4b"
+base_url = "http://127.0.0.1:8091/v1"
+model = "/models/Qwen3-4B-Q4_K_M.gguf"
+mode = "grammar"
+
+[verdict]
+baseline = "llama-grammar"
+challenger = "mistralrs-grammar"
