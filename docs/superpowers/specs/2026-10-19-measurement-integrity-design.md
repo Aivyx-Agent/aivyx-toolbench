@@ -50,7 +50,8 @@ Each `toolbench run` writes, before any reply, one header line:
   any request.
 - **Reply and status lines** carry `run_id`.
 - **`rescore`** keeps the header and `run_id`s and adds
-  `"rescored_by": {"version", "commit"}` to the header.
+  `"rescored_by": {"version", "commit"}` to the header. A legacy input (no
+  header) is rescored without adding one, so its lines stay legacy.
 - **Legacy files** (no header) are read as one run per file, with
   `run_id = "legacy:<file stem>"`, `temperature` unknown and no metadata.
   Committed results are never rewritten.
