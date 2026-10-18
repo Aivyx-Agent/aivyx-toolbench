@@ -19,6 +19,8 @@ pub struct Stats {
     pub model: String,
     pub mode: Mode,
     pub replies: usize,
+    /// Replies with a transport failure (HTTP error / timeout).
+    pub errors: usize,
     pub valid_num: usize,
     pub valid_den: usize,
     pub choice_num: usize,
@@ -34,6 +36,9 @@ pub struct Stats {
     pub flaky: Vec<String>,
 }
 
+/// (valid call, right choice, args ok) of one run.
+type RunOutcome = (bool, bool, Option<bool>);
+
 fn rate(num: usize, den: usize) -> Option<f64> {
     (den > 0).then(|| num as f64 / den as f64)
 }
@@ -45,6 +50,7 @@ impl Stats {
             model: model.into(),
             mode,
             replies: 0,
+            errors: 0,
             valid_num: 0,
             valid_den: 0,
             choice_num: 0,
@@ -85,17 +91,23 @@ impl Stats {
 }
 
 /// Keyed `"<endpoint>/<model>"`. The valid-call denominator is every reply
-/// that made a call, should have made one, or could not be parsed.
+/// that made a call, should have made one, or could not be parsed. Transport
+/// failures (`error` set: HTTP error or timeout) are excluded from the
+/// valid-call rate but still count as replies, errors and wrong choices.
+/// A `grammar_unsupported` status only applies to an endpoint with no replies.
 pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
     let mut out: BTreeMap<String, Stats> = BTreeMap::new();
-    let mut choices: BTreeMap<(String, String), Vec<bool>> = BTreeMap::new();
+    let mut runs_by: BTreeMap<(String, String), Vec<RunOutcome>> = BTreeMap::new();
+    let mut saw_status: Vec<String> = Vec::new();
     for line in lines {
         match line {
             Line::EndpointStatus(s) => {
-                let st = out
-                    .entry(format!("{}/{}", s.endpoint, s.model))
+                let key = format!("{}/{}", s.endpoint, s.model);
+                out.entry(key.clone())
                     .or_insert_with(|| Stats::new(&s.endpoint, &s.model, s.mode));
-                st.grammar_unsupported |= s.status == "grammar_unsupported";
+                if s.status == "grammar_unsupported" {
+                    saw_status.push(key);
+                }
             }
             Line::Reply(r) => {
                 let key = format!("{}/{}", r.endpoint, r.model);
@@ -105,10 +117,12 @@ pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
                 st.replies += 1;
                 // Made a call, could not be parsed, or answered in text
                 // when a call was expected (a wrong-choice Text).
-                let counts = match r.reply {
-                    Reply::ToolCall { .. } | Reply::Unparseable { .. } => true,
-                    Reply::Text { .. } => !r.checks.right_choice,
-                };
+                st.errors += usize::from(r.error.is_some());
+                let counts = r.error.is_none()
+                    && match r.reply {
+                        Reply::ToolCall { .. } | Reply::Unparseable { .. } => true,
+                        Reply::Text { .. } => !r.checks.right_choice,
+                    };
                 if counts {
                     st.valid_den += 1;
                     st.valid_num += usize::from(r.checks.valid_call());
@@ -131,19 +145,26 @@ pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
                 let cat = st.by_category.entry(r.category).or_default();
                 cat.0 += usize::from(r.checks.right_choice);
                 cat.1 += 1;
-                choices
-                    .entry((key, r.scenario.clone()))
-                    .or_default()
-                    .push(r.checks.right_choice);
+                runs_by.entry((key, r.scenario.clone())).or_default().push((
+                    r.checks.valid_call(),
+                    r.checks.right_choice,
+                    r.checks.args_ok,
+                ));
             }
         }
     }
-    for ((key, scenario), runs) in choices {
-        if runs.iter().any(|c| *c)
-            && runs.iter().any(|c| !*c)
-            && let Some(st) = out.get_mut(&key)
-        {
+    for ((key, scenario), runs) in runs_by {
+        let first = runs[0];
+        let differs = runs
+            .iter()
+            .any(|r| r.0 != first.0 || r.1 != first.1 || r.2 != first.2);
+        if differs && let Some(st) = out.get_mut(&key) {
             st.flaky.push(scenario);
+        }
+    }
+    for key in saw_status {
+        if let Some(st) = out.get_mut(&key) {
+            st.grammar_unsupported = st.replies == 0;
         }
     }
     out
@@ -195,46 +216,57 @@ pub fn verdict(stats: &BTreeMap<String, Stats>, cfg: &VerdictConfig) -> Verdict 
             pct(bc)
         ));
     }
-    match get(&cfg.challenger) {
-        Some(ch) if ch.grammar_unsupported => keep.push(format!(
-            "{} rejected the grammar request; no engine comparison",
-            cfg.challenger
-        )),
-        Some(ch) if ch.replies > 0 => {
-            let (cv, cc) = (
-                ch.valid_rate().unwrap_or(0.0),
-                ch.choice_rate().unwrap_or(0.0),
-            );
-            let edge = cv - bv >= EDGE - 1e-9 || cc - bc >= EDGE - 1e-9;
-            let comparable = match (ch.median_ms(), base.median_ms()) {
-                (Some(c), Some(b)) => c as f64 <= b as f64 * LATENCY_SLACK,
-                _ => false,
-            };
-            if edge && comparable {
-                build.push(format!(
-                    "{} beats {} by ≥ 5 points ({} / {}) at comparable speed",
-                    cfg.challenger,
-                    cfg.baseline,
-                    pct(cv),
-                    pct(cc)
-                ));
-            } else if edge {
-                keep.push(format!(
-                    "{} is better ({} / {}) but more than 20 % slower",
-                    cfg.challenger,
-                    pct(cv),
-                    pct(cc)
-                ));
-            } else {
-                keep.push(format!(
-                    "{} has no 5-point edge ({} / {})",
-                    cfg.challenger,
-                    pct(cv),
-                    pct(cc)
+    if build.is_empty() {
+        let note = keep.join("; ");
+        match get(&cfg.challenger) {
+            None => {
+                return Verdict::Undecided(format!(
+                    "challenger `{}` was not measured; condition 2 is untested ({note})",
+                    cfg.challenger
                 ));
             }
+            Some(ch) if ch.grammar_unsupported || ch.replies == 0 => {
+                return Verdict::Undecided(format!(
+                    "challenger `{}` rejected the grammar request; condition 2 is untested ({note})",
+                    cfg.challenger
+                ));
+            }
+            _ => {}
         }
-        _ => keep.push(format!("no results for challenger `{}`", cfg.challenger)),
+    }
+    if let Some(ch) = get(&cfg.challenger).filter(|c| !c.grammar_unsupported && c.replies > 0) {
+        let (cv, cc) = (
+            ch.valid_rate().unwrap_or(0.0),
+            ch.choice_rate().unwrap_or(0.0),
+        );
+        let edge = cv - bv >= EDGE - 1e-9 || cc - bc >= EDGE - 1e-9;
+        let comparable = match (ch.median_ms(), base.median_ms()) {
+            (Some(c), Some(b)) => c as f64 <= b as f64 * LATENCY_SLACK,
+            _ => false,
+        };
+        if edge && comparable {
+            build.push(format!(
+                "{} beats {} by ≥ 5 points ({} / {}) at comparable speed",
+                cfg.challenger,
+                cfg.baseline,
+                pct(cv),
+                pct(cc)
+            ));
+        } else if edge {
+            keep.push(format!(
+                "{} is better ({} / {}) but more than 20 % slower",
+                cfg.challenger,
+                pct(cv),
+                pct(cc)
+            ));
+        } else {
+            keep.push(format!(
+                "{} has no 5-point edge ({} / {})",
+                cfg.challenger,
+                pct(cv),
+                pct(cc)
+            ));
+        }
     }
     if build.is_empty() {
         Verdict::DontBuild(keep)
@@ -264,23 +296,24 @@ pub fn render(stats: &BTreeMap<String, Stats>, verdict: Option<&Verdict>) -> Str
         }
         md.push('\n');
     }
-    md.push_str("| endpoint | model | mode | replies | valid call | correct choice | args | hallucinated | median ms | p95 ms | tok/s |\n|---|---|---|---|---|---|---|---|---|---|---|\n");
+    md.push_str("| endpoint | model | mode | replies | errors | valid call | correct choice | args | hallucinated | median ms | p95 ms | tok/s |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for s in stats.values() {
         if s.grammar_unsupported {
             let _ = writeln!(
                 md,
-                "| {} | {} | {:?} | grammar unsupported | | | | | | | |",
+                "| {} | {} | {:?} | grammar unsupported | | | | | | | | |",
                 s.endpoint, s.model, s.mode
             );
             continue;
         }
         let _ = writeln!(
             md,
-            "| {} | {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             s.endpoint,
             s.model,
             s.mode,
             s.replies,
+            s.errors,
             opt_pct(s.valid_rate()),
             opt_pct(s.choice_rate()),
             opt_pct(s.args_rate()),
@@ -441,25 +474,131 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_or_unsupported_endpoints_are_undecided_or_noted() {
-        let s = stats(vec![lines("chal", 10, 10, 1)]);
-        assert!(matches!(verdict(&s, &cfg()), Verdict::Undecided(_)));
-        let mut parts = lines("base", 100, 99, 1000);
-        parts.push(Line::EndpointStatus(StatusLine {
-            endpoint: "chal".into(),
+    fn status(endpoint: &str) -> Line {
+        Line::EndpointStatus(StatusLine {
+            endpoint: endpoint.into(),
             model: "m".into(),
             mode: Mode::Grammar,
             status: "grammar_unsupported".into(),
             detail: "400".into(),
-        }));
-        let s = aggregate(&parts);
+        })
+    }
+
+    fn one(reply: Reply, checks: Checks, error: Option<&str>) -> Vec<Line> {
+        let mut l = lines("e", 1, 1, 1);
+        if let Line::Reply(r) = &mut l[0] {
+            r.reply = reply;
+            r.checks = checks;
+            r.error = error.map(Into::into);
+        }
+        l
+    }
+
+    fn no_checks() -> Checks {
+        Checks {
+            parseable: false,
+            real_name: false,
+            schema_valid: false,
+            right_choice: false,
+            args_ok: None,
+        }
+    }
+
+    #[test]
+    fn counting_rules() {
+        let text = || Reply::Text { text: "hi".into() };
+        let unp = || Reply::Unparseable { reason: "x".into() };
+        // Respond scenario answered correctly with Text: excluded.
+        let mut c = no_checks();
+        c.right_choice = true;
+        let s = aggregate(&one(text(), c, None));
+        assert_eq!((s["e/m"].valid_den, s["e/m"].choice_num), (0, 1));
+        // Text where a call was expected: counts and fails.
+        let s = aggregate(&one(text(), no_checks(), None));
+        assert_eq!((s["e/m"].valid_den, s["e/m"].valid_num), (1, 0));
+        // Parse failure: counts and fails.
+        let s = aggregate(&one(unp(), no_checks(), None));
+        assert_eq!((s["e/m"].valid_den, s["e/m"].valid_num), (1, 0));
+        assert_eq!(s["e/m"].errors, 0);
+        // Transport failure: excluded from valid_den, counted as error.
+        let s = aggregate(&one(unp(), no_checks(), Some("timeout")));
+        let e = &s["e/m"];
+        assert_eq!(
+            (e.valid_den, e.errors, e.replies, e.choice_num),
+            (0, 1, 1, 0)
+        );
+        assert_eq!(e.choice_rate(), Some(0.0));
+        assert!(render(&s, None).contains("| replies | errors |"));
+    }
+
+    #[test]
+    fn missing_challenger_is_undecided_when_baseline_clears_bars() {
+        let s = stats(vec![lines("base", 100, 99, 1000)]);
         match verdict(&s, &cfg()) {
-            Verdict::DontBuild(reasons) => {
-                assert!(reasons.iter().any(|r| r.contains("grammar")), "{reasons:?}")
+            Verdict::Undecided(r) => {
+                assert!(
+                    r.contains("not measured") && r.contains("clears both bars"),
+                    "{r}"
+                )
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn unsupported_challenger_is_undecided_when_baseline_clears_bars() {
+        let mut parts = lines("base", 100, 99, 1000);
+        parts.push(status("chal"));
+        let s = aggregate(&parts);
+        match verdict(&s, &cfg()) {
+            Verdict::Undecided(r) => {
+                assert!(
+                    r.contains("rejected the grammar") && r.contains("clears both bars"),
+                    "{r}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn weak_baseline_is_build_without_a_challenger() {
+        let s = stats(vec![lines("base", 100, 90, 1000)]);
+        assert!(matches!(verdict(&s, &cfg()), Verdict::Build(_)));
+        let mut parts = lines("base", 100, 90, 1000);
+        parts.push(status("chal"));
+        assert!(matches!(
+            verdict(&aggregate(&parts), &cfg()),
+            Verdict::Build(_)
+        ));
+    }
+
+    #[test]
+    fn missing_baseline_is_undecided() {
+        let s = stats(vec![lines("chal", 10, 10, 1)]);
+        assert!(matches!(verdict(&s, &cfg()), Verdict::Undecided(_)));
+    }
+
+    #[test]
+    fn flaky_when_args_ok_differs() {
+        let mut ls = lines("base", 20, 20, 5);
+        for (i, l) in ls.iter_mut().enumerate() {
+            if let Line::Reply(r) = l {
+                r.checks.args_ok = Some(i != 10);
+            }
+        }
+        let s = aggregate(&ls);
+        assert_eq!(s["base/m"].flaky, ["s0"]);
+    }
+
+    #[test]
+    fn status_line_does_not_hide_real_replies() {
+        let mut ls = vec![status("base")];
+        ls.extend(lines("base", 10, 10, 1));
+        let s = aggregate(&ls);
+        assert!(!s["base/m"].grammar_unsupported);
+        let only = aggregate(&[status("base")]);
+        assert!(only["base/m"].grammar_unsupported);
     }
 
     #[test]
