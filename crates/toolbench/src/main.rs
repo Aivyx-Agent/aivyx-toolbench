@@ -1,1 +1,175 @@
-fn main() {}
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+
+use toolbench::{config, report, result, runner, scenario, snapshot};
+
+#[derive(Parser)]
+#[command(
+    name = "toolbench",
+    about = "Tool-call reliability benchmark for local model servers"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List a snapshot's tools with their required and optional arguments.
+    Tools { snapshot: PathBuf },
+    /// Run every scenario against one endpoint.
+    Run {
+        #[arg(long, default_value = "toolbench.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long, default_value = "scenarios")]
+        scenarios: PathBuf,
+        #[arg(long, default_value = "fixtures/tools")]
+        snapshots: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        repeat: u32,
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Re-apply the checks to stored results.
+    Rescore {
+        input: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "scenarios")]
+        scenarios: PathBuf,
+        #[arg(long, default_value = "fixtures/tools")]
+        snapshots: PathBuf,
+    },
+    /// Markdown comparison and verdict from result files.
+    Report {
+        inputs: Vec<PathBuf>,
+        #[arg(long, default_value = "toolbench.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Fake server that saves a product's first request with tools as a snapshot.
+    Capture {
+        #[arg(long, default_value = "127.0.0.1:18080")]
+        listen: std::net::SocketAddr,
+        #[arg(long)]
+        product: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    match Cli::parse().command {
+        Command::Tools { snapshot } => {
+            let snap = snapshot::Snapshot::load(&snapshot)?;
+            for t in &snap.tools {
+                let props: Vec<&str> = t
+                    .input_schema
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|o| o.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                let required: Vec<&str> = t
+                    .input_schema
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                println!(
+                    "{}  required: [{}]  all: [{}]",
+                    t.name,
+                    required.join(", "),
+                    props.join(", ")
+                );
+            }
+        }
+        Command::Run {
+            config,
+            endpoint,
+            scenarios,
+            snapshots,
+            repeat,
+            timeout,
+            out,
+        } => {
+            let cfg = config::Config::load(&config)?;
+            let ep = cfg.endpoint(&endpoint)?;
+            let snaps = snapshot::load_dir(&snapshots)?;
+            let scs = scenario::load_dir(&scenarios, &snaps)?;
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = std::fs::File::create(&out)
+                .with_context(|| format!("creating {}", out.display()))?;
+            let opts = runner::RunOptions {
+                repeat,
+                timeout: Duration::from_secs(timeout),
+            };
+            let summary = runner::run_endpoint(ep, &scs, &snaps, &opts, &mut file).await?;
+            if summary.grammar_unsupported {
+                eprintln!(
+                    "{endpoint}: the server rejected the grammar request (HTTP 400); see {}",
+                    out.display()
+                );
+            } else {
+                eprintln!(
+                    "{endpoint}: {} replies → {}",
+                    summary.replies,
+                    out.display()
+                );
+            }
+        }
+        Command::Rescore {
+            input,
+            out,
+            scenarios,
+            snapshots,
+        } => {
+            let snaps = snapshot::load_dir(&snapshots)?;
+            let scs = scenario::load_dir(&scenarios, &snaps)?;
+            let lines = runner::rescore(&result::read_lines(&input)?, &scs, &snaps)?;
+            let mut file = std::fs::File::create(&out)?;
+            for line in &lines {
+                result::write_line(&mut file, line)?;
+            }
+        }
+        Command::Report {
+            inputs,
+            config,
+            out,
+        } => {
+            let cfg = config::Config::load(&config)?;
+            let mut lines = Vec::new();
+            for path in &inputs {
+                lines.extend(result::read_lines(path)?);
+            }
+            let stats = report::aggregate(&lines);
+            let verdict = cfg.verdict.as_ref().map(|v| report::verdict(&stats, v));
+            let md = report::render(&stats, verdict.as_ref());
+            match out {
+                Some(path) => std::fs::write(&path, md)?,
+                None => print!("{md}"),
+            }
+        }
+        Command::Capture {
+            listen,
+            product,
+            source,
+            out,
+        } => {
+            toolbench::capture::serve(listen, product, source, out).await?;
+        }
+    }
+    Ok(())
+}
