@@ -136,24 +136,24 @@ fn line_run_id(line: &Line) -> Option<&str> {
 
 /// `legacy:<stem>`, or, when an earlier input already took that,
 /// `legacy:<parent dir>/<stem>`, then `legacy:<parent dir>/<stem>#2`, ...
-fn legacy_id(path: &Path, used: &BTreeSet<String>) -> String {
+fn legacy_id(path: &Path, used: &BTreeMap<String, &Path>) -> String {
     let name = |p: Option<&std::ffi::OsStr>| {
         p.map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
     };
     let stem = name(path.file_stem());
     let plain = format!("legacy:{stem}");
-    if !used.contains(&plain) {
+    if !used.contains_key(&plain) {
         return plain;
     }
     let parent = name(path.parent().and_then(Path::file_name));
     let long = format!("legacy:{parent}/{stem}");
-    if !used.contains(&long) {
+    if !used.contains_key(&long) {
         return long;
     }
     (2..)
         .map(|n| format!("{long}#{n}"))
-        .find(|id| !used.contains(id))
+        .find(|id| !used.contains_key(id))
         .expect("an unused suffix exists")
 }
 
@@ -163,7 +163,8 @@ fn legacy_id(path: &Path, used: &BTreeSet<String>) -> String {
 /// headered `run_id` found in two inputs is an error: the same run would
 /// otherwise be counted twice.
 pub fn read_inputs(paths: &[PathBuf]) -> Result<Vec<Line>> {
-    let mut used: BTreeSet<String> = BTreeSet::new();
+    // Every run id taken so far, headered or legacy, with its file: a legacy
+    // id is never reused, and an input already carrying it is rejected.
     let mut seen: BTreeMap<String, &Path> = BTreeMap::new();
     let mut out = Vec::new();
     for path in paths {
@@ -186,7 +187,7 @@ pub fn read_inputs(paths: &[PathBuf]) -> Result<Vec<Line>> {
         if lines.iter().any(|l| {
             matches!(l, Line::Reply(_) | Line::EndpointStatus(_)) && line_run_id(l).is_none()
         }) {
-            let legacy = legacy_id(path, &used);
+            let legacy = legacy_id(path, &seen);
             for line in &mut lines {
                 match line {
                     Line::Reply(r) if r.run_id.is_none() => r.run_id = Some(legacy.clone()),
@@ -196,7 +197,7 @@ pub fn read_inputs(paths: &[PathBuf]) -> Result<Vec<Line>> {
                     _ => {}
                 }
             }
-            used.insert(legacy);
+            seen.insert(legacy, path);
         }
         out.extend(lines);
     }
@@ -286,6 +287,32 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(ids(&lines), ["legacy:llama-native", "legacy:llama-grammar"]);
+    }
+
+    #[test]
+    fn a_file_already_tagged_with_a_legacy_id_never_merges_with_a_legacy_file() {
+        // Output of an earlier `rescore` carried `legacy:<stem>` ids.
+        let dir = std::env::temp_dir().join(format!("toolbench-pretag-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("old")).unwrap();
+        let tagged = dir.join("old/llama-grammar.jsonl");
+        let mut f = std::fs::File::create(&tagged).unwrap();
+        for mut line in read_lines(&results("2026-10-18-name-first/llama-grammar.jsonl")).unwrap() {
+            if let Line::Reply(r) = &mut line {
+                r.run_id = Some("legacy:llama-grammar".into());
+            }
+            write_line(&mut f, &line).unwrap();
+        }
+        drop(f);
+        let legacy = results("2026-10-18/llama-grammar.jsonl");
+        // Tagged first: the true legacy file gets a different id.
+        let lines = read_inputs(&[tagged.clone(), legacy.clone()]).unwrap();
+        assert_eq!(
+            ids(&lines),
+            ["legacy:llama-grammar", "legacy:2026-10-18/llama-grammar"]
+        );
+        // Legacy first: the tagged copy would reuse its id, so it is refused.
+        assert!(read_inputs(&[legacy, tagged]).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
