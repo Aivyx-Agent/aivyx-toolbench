@@ -54,6 +54,12 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Use this run for an endpoint in the verdict: NAME=RUN_ID (repeatable).
+        #[arg(long = "run", value_parser = parse_pick)]
+        picks: Vec<(String, String)>,
+        /// Use each endpoint's newest run in the verdict.
+        #[arg(long)]
+        latest: bool,
     },
     /// Fake server that saves a product's first request with tools as a snapshot.
     Capture {
@@ -66,6 +72,12 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+}
+
+fn parse_pick(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .ok_or_else(|| format!("expected NAME=RUN_ID, got `{s}`"))
 }
 
 #[tokio::main]
@@ -155,6 +167,8 @@ async fn main() -> Result<()> {
             inputs,
             config,
             out,
+            picks,
+            latest,
         } => {
             let cfg = config::Config::load(&config)?;
             let mut lines = Vec::new();
@@ -162,10 +176,22 @@ async fn main() -> Result<()> {
                 lines.extend(result::read_lines_tagged(path)?);
             }
             let stats = report::aggregate(&lines);
-            let verdict = cfg.verdict.as_ref().map(|v| report::verdict(&stats, v));
-            let md = report::render(&stats, verdict.as_ref());
+            let sel = report::RunSelection {
+                picks: picks.into_iter().collect(),
+                latest,
+            };
+            let assessment = cfg
+                .verdict
+                .as_ref()
+                .map(|v| report::assess(&stats, v, &sel));
+            let md = report::render(&stats, assessment.as_ref());
             match out {
-                Some(path) => std::fs::write(&path, md)?,
+                Some(path) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, md)?
+                }
                 None => print!("{md}"),
             }
         }

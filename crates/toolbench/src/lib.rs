@@ -1,5 +1,6 @@
 //! toolbench — tool-call reliability benchmark. See the crate README.
 
+pub mod bootstrap;
 pub mod capture;
 pub mod check;
 pub mod client;

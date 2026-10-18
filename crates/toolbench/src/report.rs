@@ -1,8 +1,9 @@
 //! Aggregation, the pre-agreed verdict, and the Markdown report.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
+use crate::bootstrap::paired_ci;
 use crate::config::{Mode, VerdictConfig};
 use crate::reply::Reply;
 use crate::result::Line;
@@ -13,14 +14,43 @@ pub const MIN_CHOICE: f64 = 0.90;
 pub const EDGE: f64 = 0.05;
 pub const LATENCY_SLACK: f64 = 1.20;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Temperature {
+    Unknown,
+    ServerDefault,
+    Value(f64),
+}
+
+impl std::fmt::Display for Temperature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("?"),
+            Self::ServerDefault => f.write_str("default"),
+            Self::Value(t) => write!(f, "{t}"),
+        }
+    }
+}
+
+/// The statistics of one run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stats {
+    pub run_id: String,
+    /// From the run header; `None` for legacy runs.
+    pub started_at: Option<String>,
+    /// Index of the run's first line in the input (orders legacy runs).
+    pub order: usize,
+    pub temperature: Temperature,
+    /// `None` without a header (legacy), `Some(true)` once a `run_end` line
+    /// is seen, `Some(false)` for a header with no `run_end` (killed mid-run).
+    pub complete: Option<bool>,
     pub endpoint: String,
     pub model: String,
     pub mode: Mode,
     pub replies: usize,
     /// Replies with a transport failure (HTTP error / timeout).
     pub errors: usize,
+    /// Replies with more than one tool call.
+    pub extra_calls: usize,
     pub valid_num: usize,
     pub valid_den: usize,
     pub choice_num: usize,
@@ -33,6 +63,12 @@ pub struct Stats {
     pub grammar_unsupported: bool,
     /// (right-choice count, replies) per category.
     pub by_category: BTreeMap<Category, (usize, usize)>,
+    /// (num, den) of the valid-call rate per scenario.
+    pub scen_valid: BTreeMap<String, (usize, usize)>,
+    /// (num, den) of the correct-choice rate per scenario.
+    pub scen_choice: BTreeMap<String, (usize, usize)>,
+    /// (num, den) of the args rate per scenario.
+    pub scen_args: BTreeMap<String, (usize, usize)>,
     pub flaky: Vec<String>,
 }
 
@@ -43,14 +79,26 @@ fn rate(num: usize, den: usize) -> Option<f64> {
     (den > 0).then(|| num as f64 / den as f64)
 }
 
+fn add(map: &mut BTreeMap<String, (usize, usize)>, scenario: &str, ok: bool) {
+    let c = map.entry(scenario.to_string()).or_default();
+    c.0 += usize::from(ok);
+    c.1 += 1;
+}
+
 impl Stats {
-    fn new(endpoint: &str, model: &str, mode: Mode) -> Self {
+    fn new(run_id: &str, endpoint: &str, model: &str, mode: Mode, order: usize) -> Self {
         Self {
+            run_id: run_id.into(),
+            started_at: None,
+            order,
+            temperature: Temperature::Unknown,
+            complete: None,
             endpoint: endpoint.into(),
             model: model.into(),
             mode,
             replies: 0,
             errors: 0,
+            extra_calls: 0,
             valid_num: 0,
             valid_den: 0,
             choice_num: 0,
@@ -62,6 +110,9 @@ impl Stats {
             token_ms: 0,
             grammar_unsupported: false,
             by_category: BTreeMap::new(),
+            scen_valid: BTreeMap::new(),
+            scen_choice: BTreeMap::new(),
+            scen_args: BTreeMap::new(),
             flaky: Vec::new(),
         }
     }
@@ -73,6 +124,15 @@ impl Stats {
     }
     pub fn args_rate(&self) -> Option<f64> {
         rate(self.args_num, self.args_den)
+    }
+    pub fn valid_ci(&self) -> Option<(f64, f64)> {
+        crate::bootstrap::ci(&self.scen_valid.values().copied().collect::<Vec<_>>())
+    }
+    pub fn choice_ci(&self) -> Option<(f64, f64)> {
+        crate::bootstrap::ci(&self.scen_choice.values().copied().collect::<Vec<_>>())
+    }
+    pub fn args_ci(&self) -> Option<(f64, f64)> {
+        crate::bootstrap::ci(&self.scen_args.values().copied().collect::<Vec<_>>())
     }
     fn percentile(&self, p: f64) -> Option<u64> {
         let mut v = self.latencies_ms.clone();
@@ -90,35 +150,63 @@ impl Stats {
     }
 }
 
-/// Keyed `"<endpoint>/<model>"`. The valid-call denominator is every reply
+/// Keyed by `run_id` (a line without one falls back to
+/// `"<endpoint>/<model>"`). The valid-call denominator is every reply
 /// that made a call, should have made one, or could not be parsed. Transport
 /// failures (`error` set: HTTP error or timeout) are excluded from the
 /// valid-call rate, latency and token totals but still count as replies, errors and wrong choices.
-/// A `grammar_unsupported` status only applies to an endpoint with no replies.
+/// A `grammar_unsupported` status only applies to a run with no replies.
 pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
     let mut out: BTreeMap<String, Stats> = BTreeMap::new();
     let mut runs_by: BTreeMap<(String, String), Vec<RunOutcome>> = BTreeMap::new();
     let mut saw_status: Vec<String> = Vec::new();
-    for line in lines {
+    let mut ended: BTreeSet<String> = BTreeSet::new();
+    let key_of = |run_id: &Option<String>, endpoint: &str, model: &str| {
+        run_id
+            .clone()
+            .unwrap_or_else(|| format!("{endpoint}/{model}"))
+    };
+    for (i, line) in lines.iter().enumerate() {
         match line {
             Line::EndpointStatus(s) => {
-                let key = format!("{}/{}", s.endpoint, s.model);
+                let key = key_of(&s.run_id, &s.endpoint, &s.model);
                 out.entry(key.clone())
-                    .or_insert_with(|| Stats::new(&s.endpoint, &s.model, s.mode));
+                    .or_insert_with(|| Stats::new(&key, &s.endpoint, &s.model, s.mode, i));
                 if s.status == "grammar_unsupported" {
                     saw_status.push(key);
                 }
             }
-            Line::Run(_) | Line::RunEnd(_) => {}
+            Line::Run(h) => {
+                let ep = &h.endpoint;
+                let st = out
+                    .entry(h.run_id.clone())
+                    .or_insert_with(|| Stats::new(&h.run_id, &ep.name, &ep.model, ep.mode, i));
+                st.started_at = Some(h.started_at.clone());
+                st.temperature = match h.effective_temperature {
+                    Some(t) => Temperature::Value(t),
+                    None => Temperature::ServerDefault,
+                };
+                st.endpoint = ep.name.clone();
+                st.model = ep.model.clone();
+                st.mode = ep.mode;
+                st.complete = Some(false);
+            }
+            Line::RunEnd(e) => {
+                ended.insert(e.run_id.clone());
+            }
             Line::Reply(r) => {
-                let key = format!("{}/{}", r.endpoint, r.model);
+                let key = key_of(&r.run_id, &r.endpoint, &r.model);
                 let st = out
                     .entry(key.clone())
-                    .or_insert_with(|| Stats::new(&r.endpoint, &r.model, r.mode));
+                    .or_insert_with(|| Stats::new(&key, &r.endpoint, &r.model, r.mode, i));
                 st.replies += 1;
                 // Made a call, could not be parsed, or answered in text
                 // when a call was expected (a wrong-choice Text).
                 st.errors += usize::from(r.error.is_some());
+                st.extra_calls += usize::from(matches!(
+                    r.reply,
+                    Reply::ToolCall { extra_calls, .. } if extra_calls > 0
+                ));
                 let counts = r.error.is_none()
                     && match r.reply {
                         Reply::ToolCall { .. } | Reply::Unparseable { .. } => true,
@@ -127,11 +215,14 @@ pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
                 if counts {
                     st.valid_den += 1;
                     st.valid_num += usize::from(r.checks.valid_call());
+                    add(&mut st.scen_valid, &r.scenario, r.checks.valid_call());
                 }
                 st.choice_num += usize::from(r.checks.right_choice);
+                add(&mut st.scen_choice, &r.scenario, r.checks.right_choice);
                 if let Some(ok) = r.checks.args_ok {
                     st.args_den += 1;
                     st.args_num += usize::from(ok);
+                    add(&mut st.scen_args, &r.scenario, ok);
                 }
                 st.hallucinated += usize::from(
                     r.checks.parseable
@@ -170,6 +261,11 @@ pub fn aggregate(lines: &[Line]) -> BTreeMap<String, Stats> {
             st.grammar_unsupported = st.replies == 0;
         }
     }
+    for st in out.values_mut() {
+        if st.complete.is_some() {
+            st.complete = Some(ended.contains(&st.run_id));
+        }
+    }
     out
 }
 
@@ -180,48 +276,194 @@ pub enum Verdict {
     Undecided(String),
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunSelection {
+    /// endpoint name → run_id (`report --run name=id`).
+    pub picks: BTreeMap<String, String>,
+    /// For each endpoint name, use its newest run (`report --latest`).
+    pub latest: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assessment {
+    pub verdict: Verdict,
+    /// At least one deciding condition is within noise.
+    pub noisy: bool,
+    /// Extra lines (temperature mismatch, ...).
+    pub notes: Vec<String>,
+}
+
 fn pct(x: f64) -> String {
     format!("{:.1} %", x * 100.0)
 }
 
-pub fn verdict(stats: &BTreeMap<String, Stats>, cfg: &VerdictConfig) -> Verdict {
-    // Each model has its own endpoint name, so endpoint names identify runs.
-    let get = |ep: &str| stats.values().find(|s| s.endpoint == ep);
-    let Some(base) = get(&cfg.baseline).filter(|b| !b.grammar_unsupported && b.replies > 0) else {
+/// The runs of `name` the verdict may use, after `--run` / `--latest`.
+fn candidates<'a>(
+    stats: &'a BTreeMap<String, Stats>,
+    name: &str,
+    sel: &RunSelection,
+) -> Vec<&'a Stats> {
+    let mut c: Vec<&Stats> = stats.values().filter(|s| s.endpoint == name).collect();
+    if let Some(id) = sel.picks.get(name) {
+        c.retain(|s| &s.run_id == id);
+    } else if sel.latest && c.len() > 1 {
+        let newest = c
+            .iter()
+            .max_by(|a, b| {
+                (a.started_at.as_deref(), a.order).cmp(&(b.started_at.as_deref(), b.order))
+            })
+            .copied();
+        c = newest.into_iter().collect();
+    }
+    c
+}
+
+fn with_ci(rate: f64, ci: Option<(f64, f64)>) -> String {
+    match ci {
+        Some((lo, hi)) => format!("{} [{:.1}–{:.1}]", pct(rate), lo * 100.0, hi * 100.0),
+        None => pct(rate),
+    }
+}
+
+fn noise(clearly: bool) -> &'static str {
+    if clearly { "clearly" } else { "within noise" }
+}
+
+fn many_runs(n: usize, name: &str) -> String {
+    format!("{n} runs of `{name}`; choose one with --run {name}=<run_id> or --latest")
+}
+
+/// `+15.3 pts [6.1–24.0]`: the rounded point difference `b − a` and the
+/// paired CI, if there is one.
+fn edge_text(a: f64, b: f64, ci: Option<(f64, f64, f64)>) -> String {
+    let pts = ((b * 1000.0).round() - (a * 1000.0).round()) / 10.0;
+    match ci {
+        Some((_, lo, hi)) => format!("{pts:+.1} pts [{:.1}–{:.1}]", lo * 100.0, hi * 100.0),
+        None => format!("{pts:+.1} pts"),
+    }
+}
+
+fn incomplete_note(s: &Stats, notes: &mut Vec<String>) {
+    if s.complete == Some(false) {
+        notes.push(format!(
+            "run `{}` of `{}` is incomplete (no run_end line)",
+            s.run_id, s.endpoint
+        ));
+    }
+}
+
+pub fn assess(
+    stats: &BTreeMap<String, Stats>,
+    cfg: &VerdictConfig,
+    sel: &RunSelection,
+) -> Assessment {
+    let mut noisy = false;
+    let mut notes = Vec::new();
+    let verdict = decide(stats, cfg, sel, &mut noisy, &mut notes);
+    Assessment {
+        verdict,
+        noisy,
+        notes,
+    }
+}
+
+pub fn verdict(
+    stats: &BTreeMap<String, Stats>,
+    cfg: &VerdictConfig,
+    sel: &RunSelection,
+) -> Verdict {
+    assess(stats, cfg, sel).verdict
+}
+
+fn decide(
+    stats: &BTreeMap<String, Stats>,
+    cfg: &VerdictConfig,
+    sel: &RunSelection,
+    noisy: &mut bool,
+    notes: &mut Vec<String>,
+) -> Verdict {
+    // Each model has its own endpoint name, so endpoint names identify
+    // runs; several runs of one name need `--run` or `--latest`.
+    let bases = candidates(stats, &cfg.baseline, sel);
+    if bases.len() > 1 {
+        return Verdict::Undecided(many_runs(bases.len(), &cfg.baseline));
+    }
+    let Some(base) = bases
+        .first()
+        .copied()
+        .filter(|b| !b.grammar_unsupported && b.replies > 0)
+    else {
         return Verdict::Undecided(format!("no usable results for baseline `{}`", cfg.baseline));
     };
+    incomplete_note(base, notes);
     let (Some(bv), Some(bc)) = (base.valid_rate(), base.choice_rate()) else {
         return Verdict::Undecided("baseline has no rates".into());
+    };
+    let chs = candidates(stats, &cfg.challenger, sel);
+    let challenger = match chs.as_slice() {
+        [] => None,
+        [one] => {
+            incomplete_note(one, notes);
+            if one.temperature != base.temperature
+                || one.temperature == Temperature::Unknown
+                || base.temperature == Temperature::Unknown
+            {
+                notes.push(format!(
+                    "baseline and challenger temperatures differ or are unknown ({} vs {})",
+                    base.temperature, one.temperature
+                ));
+            }
+            Some(*one)
+        }
+        // Ambiguous: decided below, once it is known whether it matters.
+        _ => None,
     };
     let mut build = Vec::new();
     let mut keep = Vec::new();
     if bv < MIN_VALID {
+        let (_, hi) = base.valid_ci().unwrap_or((bv, bv));
+        let clearly = hi < MIN_VALID;
+        *noisy |= !clearly;
         build.push(format!(
-            "{} valid-call rate {} is below {}",
+            "{} valid-call rate {} is below {}, {}",
             cfg.baseline,
-            pct(bv),
-            pct(MIN_VALID)
+            with_ci(bv, base.valid_ci()),
+            pct(MIN_VALID),
+            noise(clearly)
         ));
     }
     if bc < MIN_CHOICE {
+        let (_, hi) = base.choice_ci().unwrap_or((bc, bc));
+        let clearly = hi < MIN_CHOICE;
+        *noisy |= !clearly;
         build.push(format!(
-            "{} correct-choice rate {} is below {}",
+            "{} correct-choice rate {} is below {}, {}",
             cfg.baseline,
-            pct(bc),
-            pct(MIN_CHOICE)
+            with_ci(bc, base.choice_ci()),
+            pct(MIN_CHOICE),
+            noise(clearly)
         ));
     }
-    if build.is_empty() {
+    let cleared = build.is_empty();
+    if cleared {
+        let valid_lo = base.valid_ci().map_or(bv, |c| c.0);
+        let choice_lo = base.choice_ci().map_or(bc, |c| c.0);
+        let clearly = valid_lo >= MIN_VALID && choice_lo >= MIN_CHOICE;
+        *noisy |= !clearly;
         keep.push(format!(
-            "{} clears both bars ({} valid, {} correct choice)",
+            "{} clears both bars ({} valid, {} correct choice), {}",
             cfg.baseline,
-            pct(bv),
-            pct(bc)
+            with_ci(bv, base.valid_ci()),
+            with_ci(bc, base.choice_ci()),
+            noise(clearly)
         ));
     }
-    if build.is_empty() {
+    if cleared {
         let note = keep.join("; ");
-        match get(&cfg.challenger) {
+        if chs.len() > 1 {
+            return Verdict::Undecided(many_runs(chs.len(), &cfg.challenger));
+        }
+        match challenger {
             None => {
                 return Verdict::Undecided(format!(
                     "challenger `{}` was not measured; condition 2 is untested ({note})",
@@ -249,42 +491,48 @@ pub fn verdict(stats: &BTreeMap<String, Stats>, cfg: &VerdictConfig) -> Verdict 
             _ => {}
         }
     }
-    if let Some(ch) = get(&cfg.challenger)
-        .filter(|c| !c.grammar_unsupported && c.replies > 0 && c.valid_rate().is_some())
+    if !cleared && chs.len() > 1 {
+        // The outcome is Build either way; the edge is just not compared.
+        notes.push(many_runs(chs.len(), &cfg.challenger));
+    }
+    if let Some(ch) =
+        challenger.filter(|c| !c.grammar_unsupported && c.replies > 0 && c.valid_rate().is_some())
     {
         let (cv, cc) = (
             ch.valid_rate().unwrap_or(0.0),
             ch.choice_rate().unwrap_or(0.0),
         );
-        let edge = cv - bv >= EDGE - 1e-9 || cc - bc >= EDGE - 1e-9;
+        let pv = paired_ci(&base.scen_valid, &ch.scen_valid);
+        let pc = paired_ci(&base.scen_choice, &ch.scen_choice);
+        // The rule compares point values, exactly as before the CIs.
+        let v_edge = cv - bv >= EDGE - 1e-9;
+        let c_edge = cc - bc >= EDGE - 1e-9;
+        let edge = v_edge || c_edge;
         let comparable = match (ch.median_ms(), base.median_ms()) {
             (Some(c), Some(b)) => c as f64 <= b as f64 * LATENCY_SLACK,
             _ => false,
         };
+        let edge_clearly = |ci: Option<(f64, f64, f64)>| ci.is_some_and(|c| c.1 >= EDGE);
         if edge && comparable {
             let mut beats = Vec::new();
             let mut others = Vec::new();
-            if cv - bv >= EDGE - 1e-9 {
-                beats.push(format!(
-                    "on valid call by {:.1} points ({} vs {})",
-                    ((cv * 1000.0).round() - (bv * 1000.0).round()) / 10.0,
-                    pct(cv),
-                    pct(bv)
-                ));
-            }
-            if cc - bc >= EDGE - 1e-9 {
-                beats.push(format!(
-                    "on correct choice by {:.1} points ({} vs {})",
-                    ((cc * 1000.0).round() - (bc * 1000.0).round()) / 10.0,
-                    pct(cc),
-                    pct(bc)
-                ));
-            }
-            if cv - bv < EDGE - 1e-9 {
-                others.push(format!("valid call {} vs {}", pct(cv), pct(bv)));
-            }
-            if cc - bc < EDGE - 1e-9 {
-                others.push(format!("correct choice {} vs {}", pct(cc), pct(bc)));
+            for (fires, label, a, b, ci) in [
+                (v_edge, "valid call", bv, cv, pv),
+                (c_edge, "correct choice", bc, cc, pc),
+            ] {
+                if fires {
+                    let clearly = edge_clearly(ci);
+                    if cleared {
+                        *noisy |= !clearly;
+                    }
+                    beats.push(format!(
+                        "on {label} by {}, {}",
+                        edge_text(a, b, ci),
+                        noise(clearly)
+                    ));
+                } else {
+                    others.push(format!("{label} {} vs {}", pct(b), pct(a)));
+                }
             }
             build.push(format!(
                 "{} beats {} {} at comparable median speed; {}",
@@ -301,11 +549,18 @@ pub fn verdict(stats: &BTreeMap<String, Stats>, cfg: &VerdictConfig) -> Verdict 
                 pct(cc)
             ));
         } else {
+            // An edge is not excluded while either CI reaches 5 points.
+            let open = |ci: Option<(f64, f64, f64)>| ci.is_none_or(|c| c.2 >= EDGE);
+            let clearly = !open(pv) && !open(pc);
+            if cleared {
+                *noisy |= !clearly;
+            }
             keep.push(format!(
-                "{} has no 5-point edge ({} / {})",
+                "{} has no 5-point edge (valid call {}, correct choice {}), {}",
                 cfg.challenger,
-                pct(cv),
-                pct(cc)
+                edge_text(bv, cv, pv),
+                edge_text(bc, cc, pc),
+                noise(clearly)
             ));
         }
     }
@@ -316,14 +571,37 @@ pub fn verdict(stats: &BTreeMap<String, Stats>, cfg: &VerdictConfig) -> Verdict 
     }
 }
 
-fn opt_pct(x: Option<f64>) -> String {
-    x.map(pct).unwrap_or_else(|| "—".into())
+fn opt_ci(x: Option<f64>, ci: Option<(f64, f64)>) -> String {
+    x.map(|r| with_ci(r, ci)).unwrap_or_else(|| "—".into())
 }
 
-pub fn render(stats: &BTreeMap<String, Stats>, verdict: Option<&Verdict>) -> String {
+/// A Markdown table cell: `|` escaped.
+fn cell(s: &str) -> String {
+    s.replace('|', "\\|")
+}
+
+fn short_run(s: &Stats) -> String {
+    let id: String = s.run_id.chars().take(20).collect();
+    let mut out = cell(&id);
+    if s.complete == Some(false) {
+        out.push_str(" (incomplete)");
+    }
+    out
+}
+
+fn label(s: &Stats) -> String {
+    format!(
+        "**{} / {} ({})**",
+        cell(&s.endpoint),
+        cell(&s.model),
+        short_run(s)
+    )
+}
+
+pub fn render(stats: &BTreeMap<String, Stats>, assessment: Option<&Assessment>) -> String {
     let mut md = String::from("# toolbench report\n\n");
-    if let Some(v) = verdict {
-        let (head, reasons) = match v {
+    if let Some(a) = assessment {
+        let (head, reasons) = match &a.verdict {
             Verdict::Build(r) => ("**Verdict: build aivyx-engine.**", r.clone()),
             Verdict::DontBuild(r) => (
                 "**Verdict: don't build aivyx-engine for tool calls.**",
@@ -331,33 +609,46 @@ pub fn render(stats: &BTreeMap<String, Stats>, verdict: Option<&Verdict>) -> Str
             ),
             Verdict::Undecided(r) => ("**Verdict: undecided.**", vec![r.clone()]),
         };
-        let _ = writeln!(md, "{head}\n");
-        for r in reasons {
+        let clause = if a.noisy {
+            " (at least one deciding condition is within noise)"
+        } else {
+            ""
+        };
+        let _ = writeln!(md, "{head}{clause}\n");
+        for r in reasons.iter().chain(&a.notes) {
             let _ = writeln!(md, "- {r}");
         }
         md.push('\n');
     }
-    md.push_str("| endpoint | model | mode | replies | errors | valid call | correct choice | args | hallucinated | median ms | p95 ms | tok/s |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    md.push_str("| endpoint | model | run | date | temp | mode | replies | errors | extra calls | valid call | correct choice | args | hallucinated | median ms | p95 ms | tok/s |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for s in stats.values() {
+        let date: String = s
+            .started_at
+            .as_deref()
+            .map_or("—".into(), |d| d.chars().take(10).collect());
+        let _ = write!(
+            md,
+            "| {} | {} | {} | {} | {} | {:?} ",
+            cell(&s.endpoint),
+            cell(&s.model),
+            short_run(s),
+            date,
+            s.temperature,
+            s.mode
+        );
         if s.grammar_unsupported {
-            let _ = writeln!(
-                md,
-                "| {} | {} | {:?} | grammar unsupported | | | | | | | | |",
-                s.endpoint, s.model, s.mode
-            );
+            let _ = writeln!(md, "| grammar unsupported | | | | | | | | | |");
             continue;
         }
         let _ = writeln!(
             md,
-            "| {} | {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
-            s.endpoint,
-            s.model,
-            s.mode,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             s.replies,
             s.errors,
-            opt_pct(s.valid_rate()),
-            opt_pct(s.choice_rate()),
-            opt_pct(s.args_rate()),
+            s.extra_calls,
+            opt_ci(s.valid_rate(), s.valid_ci()),
+            opt_ci(s.choice_rate(), s.choice_ci()),
+            opt_ci(s.args_rate(), s.args_ci()),
             s.hallucinated,
             s.median_ms().map_or("—".into(), |v| v.to_string()),
             s.p95_ms().map_or("—".into(), |v| v.to_string()),
@@ -371,26 +662,14 @@ pub fn render(stats: &BTreeMap<String, Stats>, verdict: Option<&Verdict>) -> Str
             .iter()
             .map(|(c, (ok, n))| format!("{c:?} {ok}/{n}"))
             .collect();
-        let _ = writeln!(
-            md,
-            "- **{} / {}**: {}",
-            s.endpoint,
-            s.model,
-            cats.join(", ")
-        );
+        let _ = writeln!(md, "- {}: {}", label(s), cats.join(", "));
     }
     md.push_str("\n## Flaky scenarios\n\n");
     if stats.values().all(|s| s.flaky.is_empty()) {
         md.push_str("- none\n");
     }
     for s in stats.values().filter(|s| !s.flaky.is_empty()) {
-        let _ = writeln!(
-            md,
-            "- **{} / {}**: {}",
-            s.endpoint,
-            s.model,
-            s.flaky.join(", ")
-        );
+        let _ = writeln!(md, "- {}: {}", label(s), s.flaky.join(", "));
     }
     md
 }
@@ -410,7 +689,7 @@ mod tests {
             .map(|i| {
                 let ok = i < good;
                 Line::Reply(ReplyLine {
-                    run_id: None,
+                    run_id: Some(endpoint.to_string()),
                     endpoint: endpoint.into(),
                     model: "m".into(),
                     mode: Mode::Grammar,
@@ -458,7 +737,7 @@ mod tests {
     #[test]
     fn rates_and_latency() {
         let s = stats(vec![lines("base", 100, 99, 1000)]);
-        let b = &s["base/m"];
+        let b = &s["base"];
         assert_eq!(b.valid_rate(), Some(0.99));
         assert_eq!(b.choice_rate(), Some(0.99));
         assert_eq!(b.median_ms(), Some(1000));
@@ -472,7 +751,10 @@ mod tests {
             lines("base", 100, 99, 1000),
             lines("chal", 100, 100, 1000),
         ]);
-        assert!(matches!(verdict(&s, &cfg()), Verdict::DontBuild(_)));
+        assert!(matches!(
+            verdict(&s, &cfg(), &RunSelection::default()),
+            Verdict::DontBuild(_)
+        ));
     }
 
     #[test]
@@ -481,7 +763,7 @@ mod tests {
             lines("base", 100, 95, 1000),
             lines("chal", 100, 95, 1000),
         ]);
-        match verdict(&s, &cfg()) {
+        match verdict(&s, &cfg(), &RunSelection::default()) {
             Verdict::Build(reasons) => {
                 assert!(reasons.iter().any(|r| r.contains("98")), "{reasons:?}")
             }
@@ -497,7 +779,10 @@ mod tests {
             lines("chal", 1000, 1000, 1100),
         ]);
         assert!(
-            matches!(verdict(&edge, &cfg()), Verdict::DontBuild(_)),
+            matches!(
+                verdict(&edge, &cfg(), &RunSelection::default()),
+                Verdict::DontBuild(_)
+            ),
             "1.5-point edge is not enough"
         );
         let mut base = lines("base", 100, 98, 1000);
@@ -509,13 +794,16 @@ mod tests {
         }
         let big = stats(vec![base.clone(), lines("chal", 100, 100, 1150)]);
         assert!(
-            matches!(verdict(&big, &cfg()), Verdict::Build(_)),
+            matches!(
+                verdict(&big, &cfg(), &RunSelection::default()),
+                Verdict::Build(_)
+            ),
             "10-point choice edge within 20 %"
         );
-        match verdict(&big, &cfg()) {
+        match verdict(&big, &cfg(), &RunSelection::default()) {
             Verdict::Build(r) => assert!(
                 r.iter()
-                    .any(|x| x.contains("on correct choice by 10.0 points")
+                    .any(|x| x.contains("on correct choice by +10.0 pts")
                         && !x.contains("on valid call")),
                 "{r:?}"
             ),
@@ -523,14 +811,17 @@ mod tests {
         }
         let slow = stats(vec![base, lines("chal", 100, 100, 1300)]);
         assert!(
-            matches!(verdict(&slow, &cfg()), Verdict::DontBuild(_)),
+            matches!(
+                verdict(&slow, &cfg(), &RunSelection::default()),
+                Verdict::DontBuild(_)
+            ),
             "edge but 30 % slower"
         );
     }
 
     fn status(endpoint: &str) -> Line {
         Line::EndpointStatus(StatusLine {
-            run_id: None,
+            run_id: Some(endpoint.to_string()),
             endpoint: endpoint.into(),
             model: "m".into(),
             mode: Mode::Grammar,
@@ -567,17 +858,17 @@ mod tests {
         let mut c = no_checks();
         c.right_choice = true;
         let s = aggregate(&one(text(), c, None));
-        assert_eq!((s["e/m"].valid_den, s["e/m"].choice_num), (0, 1));
+        assert_eq!((s["e"].valid_den, s["e"].choice_num), (0, 1));
         // Text where a call was expected: counts and fails.
         let s = aggregate(&one(text(), no_checks(), None));
-        assert_eq!((s["e/m"].valid_den, s["e/m"].valid_num), (1, 0));
+        assert_eq!((s["e"].valid_den, s["e"].valid_num), (1, 0));
         // Parse failure: counts and fails.
         let s = aggregate(&one(unp(), no_checks(), None));
-        assert_eq!((s["e/m"].valid_den, s["e/m"].valid_num), (1, 0));
-        assert_eq!(s["e/m"].errors, 0);
+        assert_eq!((s["e"].valid_den, s["e"].valid_num), (1, 0));
+        assert_eq!(s["e"].errors, 0);
         // Transport failure: excluded from valid_den, counted as error.
         let s = aggregate(&one(unp(), no_checks(), Some("timeout")));
-        let e = &s["e/m"];
+        let e = &s["e"];
         assert_eq!(
             (e.valid_den, e.errors, e.replies, e.choice_num),
             (0, 1, 1, 0)
@@ -589,7 +880,7 @@ mod tests {
     #[test]
     fn missing_challenger_is_undecided_when_baseline_clears_bars() {
         let s = stats(vec![lines("base", 100, 99, 1000)]);
-        match verdict(&s, &cfg()) {
+        match verdict(&s, &cfg(), &RunSelection::default()) {
             Verdict::Undecided(r) => {
                 assert!(
                     r.contains("not measured") && r.contains("clears both bars"),
@@ -605,7 +896,7 @@ mod tests {
         let mut parts = lines("base", 100, 99, 1000);
         parts.push(status("chal"));
         let s = aggregate(&parts);
-        match verdict(&s, &cfg()) {
+        match verdict(&s, &cfg(), &RunSelection::default()) {
             Verdict::Undecided(r) => {
                 assert!(
                     r.contains("rejected the grammar") && r.contains("clears both bars"),
@@ -619,11 +910,14 @@ mod tests {
     #[test]
     fn weak_baseline_is_build_without_a_challenger() {
         let s = stats(vec![lines("base", 100, 90, 1000)]);
-        assert!(matches!(verdict(&s, &cfg()), Verdict::Build(_)));
+        assert!(matches!(
+            verdict(&s, &cfg(), &RunSelection::default()),
+            Verdict::Build(_)
+        ));
         let mut parts = lines("base", 100, 90, 1000);
         parts.push(status("chal"));
         assert!(matches!(
-            verdict(&aggregate(&parts), &cfg()),
+            verdict(&aggregate(&parts), &cfg(), &RunSelection::default()),
             Verdict::Build(_)
         ));
     }
@@ -631,7 +925,10 @@ mod tests {
     #[test]
     fn missing_baseline_is_undecided() {
         let s = stats(vec![lines("chal", 10, 10, 1)]);
-        assert!(matches!(verdict(&s, &cfg()), Verdict::Undecided(_)));
+        assert!(matches!(
+            verdict(&s, &cfg(), &RunSelection::default()),
+            Verdict::Undecided(_)
+        ));
     }
 
     fn all_errors(endpoint: &str, n: usize) -> Vec<Line> {
@@ -651,7 +948,7 @@ mod tests {
     fn all_error_challenger_is_undecided() {
         let mut parts = lines("base", 100, 99, 1000);
         parts.extend(all_errors("chal", 5));
-        match verdict(&aggregate(&parts), &cfg()) {
+        match verdict(&aggregate(&parts), &cfg(), &RunSelection::default()) {
             Verdict::Undecided(r) => {
                 assert!(
                     r.contains("no scorable replies") && r.contains("clears both bars"),
@@ -666,7 +963,7 @@ mod tests {
     fn zero_reply_unsupported_reason_differs() {
         let mut parts = lines("base", 100, 99, 1000);
         parts.push(status("chal"));
-        match verdict(&aggregate(&parts), &cfg()) {
+        match verdict(&aggregate(&parts), &cfg(), &RunSelection::default()) {
             Verdict::Undecided(r) => assert!(r.contains("rejected the grammar"), "{r}"),
             other => panic!("{other:?}"),
         }
@@ -677,7 +974,7 @@ mod tests {
         let mut ls = lines("e", 3, 3, 100);
         ls.extend(all_errors("e", 2));
         let s = aggregate(&ls);
-        let e = &s["e/m"];
+        let e = &s["e"];
         assert_eq!((e.replies, e.errors), (5, 2));
         assert_eq!((e.median_ms(), e.p95_ms()), (Some(100), Some(100)));
         assert_eq!(e.tokens_per_sec(), Some(100.0));
@@ -698,7 +995,7 @@ mod tests {
             }
         }
         let s = aggregate(&ls);
-        assert_eq!(s["base/m"].flaky, ["s0"]);
+        assert_eq!(s["base"].flaky, ["s0"]);
     }
 
     #[test]
@@ -706,9 +1003,9 @@ mod tests {
         let mut ls = vec![status("base")];
         ls.extend(lines("base", 10, 10, 1));
         let s = aggregate(&ls);
-        assert!(!s["base/m"].grammar_unsupported);
+        assert!(!s["base"].grammar_unsupported);
         let only = aggregate(&[status("base")]);
-        assert!(only["base/m"].grammar_unsupported);
+        assert!(only["base"].grammar_unsupported);
     }
 
     #[test]
@@ -718,11 +1015,449 @@ mod tests {
             r.checks.right_choice = false;
         } // s0 run 2 differs
         let s = aggregate(&ls);
-        assert_eq!(s["base/m"].flaky, ["s0"]);
-        let md = render(&s, Some(&verdict(&s, &cfg())));
+        assert_eq!(s["base"].flaky, ["s0"]);
+        let md = render(&s, Some(&assess(&s, &cfg(), &RunSelection::default())));
         assert!(
             md.contains("| base | m |") && md.contains("s0") && md.contains("Verdict"),
             "{md}"
         );
+    }
+    /// Retag every line with `run_id`.
+    fn tagged(mut ls: Vec<Line>, run_id: &str) -> Vec<Line> {
+        for l in ls.iter_mut() {
+            match l {
+                Line::Reply(r) => r.run_id = Some(run_id.into()),
+                Line::EndpointStatus(s) => s.run_id = Some(run_id.into()),
+                _ => {}
+            }
+        }
+        ls
+    }
+
+    fn header(run_id: &str, endpoint: &str, started_at: &str, temp: Option<f64>) -> Line {
+        use crate::config::{Endpoint, GrammarField};
+        use crate::result::{RunHeader, ScenarioInfo, ServerInfo};
+        Line::Run(RunHeader {
+            run_id: run_id.into(),
+            started_at: started_at.into(),
+            toolbench: crate::util::BuildInfo {
+                version: "0".into(),
+                commit: "c".into(),
+            },
+            endpoint: Endpoint {
+                name: endpoint.into(),
+                base_url: "http://x/v1".into(),
+                model: "m".into(),
+                mode: Mode::Grammar,
+                grammar_field: GrammarField::JsonSchema,
+                max_tokens: 64,
+                extra_body: Default::default(),
+                temperature: temp,
+            },
+            effective_temperature: temp,
+            repeat: 5,
+            timeout_s: 120,
+            snapshots: BTreeMap::new(),
+            scenarios: ScenarioInfo {
+                count: 10,
+                sha256: "a".into(),
+            },
+            server: ServerInfo { models: vec![] },
+            rescored_by: None,
+        })
+    }
+
+    fn run_end(run_id: &str) -> Line {
+        Line::RunEnd(crate::result::RunEnd {
+            run_id: run_id.into(),
+            fingerprint: None,
+            replies: 0,
+        })
+    }
+
+    /// A complete run: header, replies, run_end.
+    fn run(run_id: &str, started_at: &str, temp: Option<f64>, ls: Vec<Line>) -> Vec<Line> {
+        let endpoint = match &ls[0] {
+            Line::Reply(r) => r.endpoint.clone(),
+            _ => unreachable!(),
+        };
+        let mut out = vec![header(run_id, &endpoint, started_at, temp)];
+        out.extend(tagged(ls, run_id));
+        out.push(run_end(run_id));
+        out
+    }
+
+    /// `n_scen` scenarios × `runs` runs of perfect calls; `bad(scen, run)`
+    /// makes a reply a hallucinated call, `wrong(scen, run)` a valid call to
+    /// the wrong tool.
+    fn grid(
+        endpoint: &str,
+        n_scen: usize,
+        runs: usize,
+        ms: u64,
+        bad: &dyn Fn(usize, usize) -> bool,
+        wrong: &dyn Fn(usize, usize) -> bool,
+    ) -> Vec<Line> {
+        let mut ls = lines(endpoint, n_scen * runs, n_scen * runs, ms);
+        for (i, l) in ls.iter_mut().enumerate() {
+            if let Line::Reply(r) = l {
+                let (sc, rn) = (i % n_scen, i / n_scen);
+                r.scenario = format!("s{sc}");
+                r.run = rn as u32 + 1;
+                if bad(sc, rn) {
+                    r.checks.real_name = false;
+                    r.checks.schema_valid = false;
+                    r.checks.right_choice = false;
+                } else if wrong(sc, rn) {
+                    r.checks.right_choice = false;
+                }
+            }
+        }
+        ls
+    }
+
+    fn never(_: usize, _: usize) -> bool {
+        false
+    }
+
+    #[test]
+    fn two_runs_of_one_endpoint_are_two_stats() {
+        let s = aggregate(
+            &[
+                tagged(lines("base", 100, 99, 1000), "r1"),
+                tagged(lines("base", 100, 90, 1000), "r2"),
+            ]
+            .concat(),
+        );
+        assert_eq!(s.len(), 2);
+        assert_eq!(s["r1"].valid_rate(), Some(0.99));
+        assert_eq!(s["r2"].valid_rate(), Some(0.90));
+        assert!(s["r1"].order < s["r2"].order);
+    }
+
+    #[test]
+    fn a_header_sets_date_temperature_and_completeness() {
+        let mut ls = run(
+            "r1",
+            "2026-10-19T08:00:00Z",
+            Some(0.6),
+            lines("a", 10, 10, 1),
+        );
+        ls.extend(run(
+            "r2",
+            "2026-10-19T09:00:00Z",
+            None,
+            lines("b", 10, 10, 1),
+        ));
+        // Killed mid-run: header but no run_end.
+        ls.push(header("r3", "c", "2026-10-19T10:00:00Z", None));
+        ls.extend(tagged(lines("c", 10, 10, 1), "r3"));
+        ls.extend(lines("legacy", 10, 10, 1));
+        if let Line::Reply(r) = &mut ls[1] {
+            r.reply = Reply::ToolCall {
+                name: "fs.read".into(),
+                arguments: json!({}),
+                extra_calls: 2,
+            };
+        }
+        let s = aggregate(&ls);
+        assert_eq!(s["r1"].started_at.as_deref(), Some("2026-10-19T08:00:00Z"));
+        assert_eq!(s["r1"].temperature, Temperature::Value(0.6));
+        assert_eq!(s["r2"].temperature, Temperature::ServerDefault);
+        assert_eq!(s["legacy"].temperature, Temperature::Unknown);
+        assert_eq!(s["legacy"].started_at, None);
+        assert_eq!(
+            (s["r1"].complete, s["r3"].complete, s["legacy"].complete),
+            (Some(true), Some(false), None)
+        );
+        assert_eq!((s["r1"].extra_calls, s["r2"].extra_calls), (1, 0));
+        assert_eq!(s["r1"].replies, 10);
+    }
+
+    #[test]
+    fn choice_ci_brackets_a_half() {
+        // Even scenarios always wrong, odd always right.
+        let ls = grid("base", 10, 10, 1, &never, &|sc, _| sc % 2 == 0);
+        let s = aggregate(&ls);
+        assert_eq!(s["base"].choice_rate(), Some(0.5));
+        let (lo, hi) = s["base"].choice_ci().unwrap();
+        assert!(lo < 0.5 && 0.5 < hi, "{lo} {hi}");
+        assert_eq!(s["base"].valid_ci(), Some((1.0, 1.0)));
+        assert_eq!(s["base"].args_ci(), None);
+    }
+
+    #[test]
+    fn several_baseline_runs_need_a_selection() {
+        let mut ls = run(
+            "r1",
+            "2026-10-19T08:00:00Z",
+            None,
+            lines("base", 100, 99, 1000),
+        );
+        ls.extend(run(
+            "r2",
+            "2026-10-19T09:00:00Z",
+            None,
+            lines("base", 100, 90, 1000),
+        ));
+        ls.extend(run(
+            "c1",
+            "2026-10-19T08:00:00Z",
+            None,
+            lines("chal", 100, 100, 1000),
+        ));
+        let s = aggregate(&ls);
+        match verdict(&s, &cfg(), &RunSelection::default()) {
+            Verdict::Undecided(r) => {
+                assert!(
+                    r.contains("2 runs of `base`") && r.contains("--latest"),
+                    "{r}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        let latest = RunSelection {
+            latest: true,
+            ..Default::default()
+        };
+        assert!(matches!(verdict(&s, &cfg(), &latest), Verdict::Build(_)));
+        let pick = RunSelection {
+            picks: BTreeMap::from([("base".to_string(), "r1".to_string())]),
+            latest: false,
+        };
+        assert!(matches!(verdict(&s, &cfg(), &pick), Verdict::DontBuild(_)));
+        // A pick that matches nothing leaves no baseline.
+        let none = RunSelection {
+            picks: BTreeMap::from([("base".to_string(), "zz".to_string())]),
+            latest: false,
+        };
+        assert!(matches!(verdict(&s, &cfg(), &none), Verdict::Undecided(_)));
+    }
+
+    #[test]
+    fn legacy_runs_sort_by_file_order_for_latest() {
+        let ls = [
+            tagged(lines("base", 100, 90, 1000), "legacy:old"),
+            tagged(lines("base", 100, 99, 1000), "legacy:new"),
+            lines("chal", 100, 100, 1000),
+        ]
+        .concat();
+        let s = aggregate(&ls);
+        let latest = RunSelection {
+            latest: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            verdict(&s, &cfg(), &latest),
+            Verdict::DontBuild(_)
+        ));
+    }
+
+    #[test]
+    fn several_challenger_runs_matter_only_when_it_is_consulted() {
+        let mut ls = lines("base", 100, 99, 1000);
+        ls.extend(tagged(lines("chal", 100, 100, 1000), "c1"));
+        ls.extend(tagged(lines("chal", 100, 100, 1000), "c2"));
+        match verdict(&aggregate(&ls), &cfg(), &RunSelection::default()) {
+            Verdict::Undecided(r) => assert!(r.contains("2 runs of `chal`"), "{r}"),
+            other => panic!("{other:?}"),
+        }
+        // A weak baseline is Build either way; the ambiguity is a note.
+        let mut ls = lines("base", 100, 90, 1000);
+        ls.extend(tagged(lines("chal", 100, 100, 1000), "c1"));
+        ls.extend(tagged(lines("chal", 100, 100, 1000), "c2"));
+        let a = assess(&aggregate(&ls), &cfg(), &RunSelection::default());
+        assert!(matches!(a.verdict, Verdict::Build(_)));
+        assert!(
+            a.notes.iter().any(|n| n.contains("2 runs of `chal`")),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn a_bar_miss_says_whether_it_is_within_noise() {
+        // 20 scenarios × 5 runs, one scenario always fails: 95/100.
+        let ls = grid("base", 20, 5, 1000, &|sc, _| sc == 0, &never);
+        let a = assess(&aggregate(&ls), &cfg(), &RunSelection::default());
+        match &a.verdict {
+            Verdict::Build(r) => assert!(
+                r.iter()
+                    .any(|x| x.contains("below 98.0 %") && x.contains("within noise")),
+                "{r:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(a.noisy);
+        let a = assess(
+            &aggregate(&lines("base", 100, 50, 1000)),
+            &cfg(),
+            &RunSelection::default(),
+        );
+        match &a.verdict {
+            Verdict::Build(r) => assert!(
+                r.iter()
+                    .all(|x| x.contains("clearly") && !x.contains("within noise")),
+                "{r:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(!a.noisy);
+    }
+
+    #[test]
+    fn a_challenger_edge_says_whether_it_is_within_noise() {
+        // Baseline wrong on one run in ten of every scenario: 90 % choice,
+        // the same in every scenario, so the paired CI is tight at +10.
+        let base = grid("base", 40, 10, 1000, &never, &|_, rn| rn == 0);
+        let chal = grid("chal", 40, 10, 1000, &never, &never);
+        let a = assess(
+            &aggregate(&[base, chal.clone()].concat()),
+            &cfg(),
+            &RunSelection::default(),
+        );
+        match &a.verdict {
+            Verdict::Build(r) => assert!(
+                r.iter()
+                    .any(|x| x.contains("on correct choice by +10.0 pts [10.0–10.0], clearly")),
+                "{r:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(!a.noisy, "{a:?}");
+        // Baseline always wrong in 4 of 40 scenarios: also +10, but the CI
+        // reaches below 5 points.
+        let base = grid("base", 40, 10, 1000, &never, &|sc, _| sc < 4);
+        let a = assess(
+            &aggregate(&[base, chal].concat()),
+            &cfg(),
+            &RunSelection::default(),
+        );
+        match &a.verdict {
+            Verdict::Build(r) => assert!(
+                r.iter()
+                    .any(|x| x.contains("on correct choice by +10.0 pts [")
+                        && x.contains("within noise")),
+                "{r:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(a.noisy);
+    }
+
+    #[test]
+    fn no_edge_says_whether_one_is_excluded() {
+        let s = stats(vec![
+            lines("base", 100, 100, 1000),
+            lines("chal", 100, 100, 1000),
+        ]);
+        let a = assess(&s, &cfg(), &RunSelection::default());
+        match &a.verdict {
+            Verdict::DontBuild(r) => assert!(
+                r.iter().any(|x| x.contains("has no 5-point edge")
+                    && x.contains("+0.0 pts [0.0–0.0]")
+                    && x.contains("clearly")),
+                "{r:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(!a.noisy, "{a:?}");
+    }
+
+    #[test]
+    fn different_temperatures_add_a_note() {
+        let mut ls = run(
+            "b1",
+            "2026-10-19T08:00:00Z",
+            Some(0.6),
+            lines("base", 100, 99, 1000),
+        );
+        ls.extend(run(
+            "c1",
+            "2026-10-19T08:00:00Z",
+            None,
+            lines("chal", 100, 100, 1000),
+        ));
+        let a = assess(&aggregate(&ls), &cfg(), &RunSelection::default());
+        assert!(
+            a.notes
+                .iter()
+                .any(|n| n.contains("temperatures differ or are unknown (0.6 vs default)")),
+            "{a:?}"
+        );
+        let mut ls = run(
+            "b1",
+            "2026-10-19T08:00:00Z",
+            Some(0.6),
+            lines("base", 100, 99, 1000),
+        );
+        ls.extend(run(
+            "c1",
+            "2026-10-19T08:00:00Z",
+            Some(0.6),
+            lines("chal", 100, 100, 1000),
+        ));
+        let a = assess(&aggregate(&ls), &cfg(), &RunSelection::default());
+        assert!(a.notes.is_empty(), "{a:?}");
+        // Legacy runs are unknown.
+        let s = stats(vec![
+            lines("base", 100, 99, 1000),
+            lines("chal", 100, 100, 1000),
+        ]);
+        let a = assess(&s, &cfg(), &RunSelection::default());
+        assert!(a.notes.iter().any(|n| n.contains("(? vs ?)")), "{a:?}");
+    }
+
+    #[test]
+    fn an_incomplete_run_is_flagged() {
+        let mut ls = vec![header("b1", "base", "2026-10-19T08:00:00Z", None)];
+        ls.extend(tagged(lines("base", 100, 99, 1000), "b1"));
+        ls.extend(run(
+            "c1",
+            "2026-10-19T08:00:00Z",
+            None,
+            lines("chal", 100, 100, 1000),
+        ));
+        let s = aggregate(&ls);
+        let a = assess(&s, &cfg(), &RunSelection::default());
+        assert!(matches!(a.verdict, Verdict::DontBuild(_)));
+        assert_eq!(
+            a.notes,
+            ["run `b1` of `base` is incomplete (no run_end line)"],
+            "{a:?}"
+        );
+        let md = render(&s, Some(&a));
+        assert!(md.contains("| b1 (incomplete) |"), "{md}");
+        assert!(md.contains("| c1 |"), "{md}");
+        assert!(md.contains("- run `b1` of `base` is incomplete"), "{md}");
+    }
+
+    #[test]
+    fn render_escapes_pipes_and_prints_cis_and_extra_calls() {
+        let s = aggregate(&lines("a|b", 100, 50, 5));
+        let md = render(&s, None);
+        assert!(
+            md.contains("| a\\|b | m | a\\|b | — | ? | Grammar |"),
+            "{md}"
+        );
+        assert!(md.contains("| extra calls |"), "{md}");
+        assert!(md.contains("50.0 % [50.0–50.0]"), "{md}");
+        assert!(md.contains("**a\\|b / m (a\\|b)**"), "{md}");
+    }
+
+    #[test]
+    fn render_adds_the_noise_clause() {
+        let ls = grid("base", 20, 5, 1000, &|sc, _| sc == 0, &never);
+        let s = aggregate(&ls);
+        let a = assess(&s, &cfg(), &RunSelection::default());
+        assert!(a.noisy);
+        let md = render(&s, Some(&a));
+        assert!(
+            md.contains(
+                "**Verdict: build aivyx-engine.** (at least one deciding condition is within noise)"
+            ),
+            "{md}"
+        );
+        let quiet = Assessment { noisy: false, ..a };
+        assert!(!render(&s, Some(&quiet)).contains("within noise)"));
     }
 }
