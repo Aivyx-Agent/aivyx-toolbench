@@ -1,0 +1,11 @@
+id = "coder-required-branch"
+product = "coder"
+category = "required_args"
+messages = [
+  { role = "user", content = "Create a branch called fix-typo" },
+]
+
+[expect]
+kind = "tool_call"
+tool = "git_branch"
+args.name = { contains = "fix-typo" }

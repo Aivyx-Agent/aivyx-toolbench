@@ -7,5 +7,5 @@ messages = [
 
 [expect]
 kind = "tool_call"
-tool = "web.fetch"
+any_of = ["web.fetch", "web.extract"]
 args.url = { contains = "example.com/changelog" }

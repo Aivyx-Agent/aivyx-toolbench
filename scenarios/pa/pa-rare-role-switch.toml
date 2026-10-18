@@ -2,9 +2,10 @@ id = "pa-rare-role-switch"
 product = "pa"
 category = "rare_tool"
 messages = [
-  { role = "user", content = "Switch to your researcher role" },
+  { role = "user", content = "Switch to your researcher role and have it look up recent DNS changes for example.org" },
 ]
 
 [expect]
 kind = "tool_call"
 tool = "role.switch"
+args.target = { contains = "researcher" }

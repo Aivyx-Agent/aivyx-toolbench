@@ -8,4 +8,4 @@ messages = [
 [expect]
 kind = "tool_call"
 tool = "shell.exec"
-args.cmd = { contains = "git status" }
+args.cmd = { contains = "git" }

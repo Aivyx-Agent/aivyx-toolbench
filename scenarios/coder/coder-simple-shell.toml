@@ -8,3 +8,4 @@ messages = [
 [expect]
 kind = "tool_call"
 tool = "run_command"
+args.command = { contains = "test" }

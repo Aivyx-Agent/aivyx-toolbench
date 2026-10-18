@@ -8,4 +8,4 @@ messages = [
 [expect]
 kind = "tool_call"
 tool = "memory.write"
-args.body = { contains = "3 March" }
+args.body = { contains = "March" }

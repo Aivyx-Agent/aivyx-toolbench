@@ -2,7 +2,7 @@ id = "coder-rare-references"
 product = "coder"
 category = "rare_tool"
 messages = [
-  { role = "user", content = "Who calls `load_settings`? Use the language server." },
+  { role = "user", content = "Who calls `load_settings`, defined in src/config.rs line 18, column 8. Use the language server." },
 ]
 
 [expect]
