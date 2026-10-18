@@ -12,8 +12,12 @@ aivyx-pa by git rev) and `crates/toolbench` (benchmark CLI).
 ## Rules
 
 - `aivyx-stencil` output must stay byte-identical to what aivyx-pa relied on
-  when it was extracted; pa's own tests are the second check. No I/O, no
-  async, dependencies serde + serde_json only.
+  when it was extracted, for tool schemas without local `$defs`/`definitions`
+  (those are hoisted into the grammar root since b848525); pa's frozen golden
+  test is the second check. No I/O, no async, dependencies serde + serde_json
+  only.
+- `results/2026-10-18/DECISION.md` records why aivyx-engine was not built
+  despite the mechanical verdict: read it before re-running the comparison.
 - toolbench never executes a tool; it only scores replies.
 - Snapshots under `fixtures/tools/` come from `toolbench capture`, never by
   hand. Scenarios are synthetic: no real user data, ever (public repo).
