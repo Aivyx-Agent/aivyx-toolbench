@@ -333,14 +333,34 @@ fn many_runs(n: usize, name: &str) -> String {
     format!("{n} runs of `{name}`; choose one with --run {name}=<run_id> or --latest")
 }
 
-/// `+15.3 pts [6.1–24.0]`: the rounded point difference `b − a` and the
-/// paired CI, if there is one.
+/// `+15.3 pts [6.1–24.0]`: the paired point and CI over the shared
+/// scenarios, so the point always lies in its bracket; without a paired CI,
+/// the overall difference `b − a`.
 fn edge_text(a: f64, b: f64, ci: Option<(f64, f64, f64)>) -> String {
-    let pts = ((b * 1000.0).round() - (a * 1000.0).round()) / 10.0;
     match ci {
-        Some((_, lo, hi)) => format!("{pts:+.1} pts [{:.1}–{:.1}]", lo * 100.0, hi * 100.0),
-        None => format!("{pts:+.1} pts"),
+        Some((p, lo, hi)) => format!(
+            "{:+.1} pts [{:.1}–{:.1}]",
+            p * 100.0,
+            lo * 100.0,
+            hi * 100.0
+        ),
+        None => format!(
+            "{:+.1} pts",
+            ((b * 1000.0).round() - (a * 1000.0).round()) / 10.0
+        ),
     }
+}
+
+/// `--run name=id` that matches no run of `name`.
+fn pick_miss(stats: &BTreeMap<String, Stats>, name: &str, sel: &RunSelection) -> Option<String> {
+    let id = sel.picks.get(name)?;
+    let runs: Vec<&str> = stats
+        .values()
+        .filter(|s| s.endpoint == name)
+        .map(|s| s.run_id.as_str())
+        .collect();
+    (!runs.contains(&id.as_str()))
+        .then(|| format!("no run `{id}` of `{name}` (runs: {})", runs.join(", ")))
 }
 
 fn incomplete_note(s: &Stats, notes: &mut Vec<String>) {
@@ -384,6 +404,9 @@ fn decide(
 ) -> Verdict {
     // Each model has its own endpoint name, so endpoint names identify
     // runs; several runs of one name need `--run` or `--latest`.
+    if let Some(miss) = pick_miss(stats, &cfg.baseline, sel) {
+        return Verdict::Undecided(miss);
+    }
     let bases = candidates(stats, &cfg.baseline, sel);
     if bases.len() > 1 {
         return Verdict::Undecided(many_runs(bases.len(), &cfg.baseline));
@@ -460,6 +483,9 @@ fn decide(
     }
     if cleared {
         let note = keep.join("; ");
+        if let Some(miss) = pick_miss(stats, &cfg.challenger, sel) {
+            return Verdict::Undecided(miss);
+        }
         if chs.len() > 1 {
             return Verdict::Undecided(many_runs(chs.len(), &cfg.challenger));
         }
@@ -491,9 +517,13 @@ fn decide(
             _ => {}
         }
     }
-    if !cleared && chs.len() > 1 {
+    if !cleared {
         // The outcome is Build either way; the edge is just not compared.
-        notes.push(many_runs(chs.len(), &cfg.challenger));
+        if let Some(miss) = pick_miss(stats, &cfg.challenger, sel) {
+            notes.push(miss);
+        } else if chs.len() > 1 {
+            notes.push(many_runs(chs.len(), &cfg.challenger));
+        }
     }
     if let Some(ch) =
         challenger.filter(|c| !c.grammar_unsupported && c.replies > 0 && c.valid_rate().is_some())
@@ -504,7 +534,8 @@ fn decide(
         );
         let pv = paired_ci(&base.scen_valid, &ch.scen_valid);
         let pc = paired_ci(&base.scen_choice, &ch.scen_choice);
-        // The rule compares point values, exactly as before the CIs.
+        // The outcome compares the overall-rate points, exactly as before
+        // the CIs; the paired CI (and its point) is only what gets printed.
         let v_edge = cv - bv >= EDGE - 1e-9;
         let c_edge = cc - bc >= EDGE - 1e-9;
         let edge = v_edge || c_edge;
@@ -512,7 +543,7 @@ fn decide(
             (Some(c), Some(b)) => c as f64 <= b as f64 * LATENCY_SLACK,
             _ => false,
         };
-        let edge_clearly = |ci: Option<(f64, f64, f64)>| ci.is_some_and(|c| c.1 >= EDGE);
+        let edge_clearly = |ci: Option<(f64, f64, f64)>| ci.is_some_and(|c| c.1 >= EDGE - 1e-9);
         if edge && comparable {
             let mut beats = Vec::new();
             let mut others = Vec::new();
@@ -526,7 +557,7 @@ fn decide(
                         *noisy |= !clearly;
                     }
                     beats.push(format!(
-                        "on {label} by {}, {}",
+                        "on {label} by {} ({})",
                         edge_text(a, b, ci),
                         noise(clearly)
                     ));
@@ -535,7 +566,7 @@ fn decide(
                 }
             }
             build.push(format!(
-                "{} beats {} {} at comparable median speed; {}",
+                "{} beats {} {}, at comparable median speed; {}",
                 cfg.challenger,
                 cfg.baseline,
                 beats.join(" and "),
@@ -580,9 +611,8 @@ fn cell(s: &str) -> String {
     s.replace('|', "\\|")
 }
 
-fn short_run(s: &Stats) -> String {
-    let id: String = s.run_id.chars().take(20).collect();
-    let mut out = cell(&id);
+fn run_cell(s: &Stats) -> String {
+    let mut out = cell(&s.run_id);
     if s.complete == Some(false) {
         out.push_str(" (incomplete)");
     }
@@ -594,7 +624,7 @@ fn label(s: &Stats) -> String {
         "**{} / {} ({})**",
         cell(&s.endpoint),
         cell(&s.model),
-        short_run(s)
+        run_cell(s)
     )
 }
 
@@ -631,7 +661,7 @@ pub fn render(stats: &BTreeMap<String, Stats>, assessment: Option<&Assessment>) 
             "| {} | {} | {} | {} | {} | {:?} ",
             cell(&s.endpoint),
             cell(&s.model),
-            short_run(s),
+            run_cell(s),
             date,
             s.temperature,
             s.mode
@@ -1231,7 +1261,80 @@ mod tests {
             picks: BTreeMap::from([("base".to_string(), "zz".to_string())]),
             latest: false,
         };
-        assert!(matches!(verdict(&s, &cfg(), &none), Verdict::Undecided(_)));
+        match verdict(&s, &cfg(), &none) {
+            Verdict::Undecided(r) => {
+                assert_eq!(r, "no run `zz` of `base` (runs: r1, r2)")
+            }
+            other => panic!("{other:?}"),
+        }
+        // A challenger pick that matches nothing, once the challenger decides.
+        let chal_miss = RunSelection {
+            picks: BTreeMap::from([
+                ("base".to_string(), "r1".to_string()),
+                ("chal".to_string(), "zz".to_string()),
+            ]),
+            latest: false,
+        };
+        match verdict(&s, &cfg(), &chal_miss) {
+            Verdict::Undecided(r) => assert_eq!(r, "no run `zz` of `chal` (runs: c1)"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_run_cell_shows_the_full_run_id() {
+        let ls = [
+            run(
+                "20261019T081502Z-abcd",
+                "2026-10-19T08:15:02Z",
+                None,
+                lines("a", 10, 10, 1),
+            ),
+            tagged(lines("b", 10, 10, 1), "legacy:mistralrs-grammar-think"),
+        ]
+        .concat();
+        let md = render(&aggregate(&ls), None);
+        assert!(
+            md.contains("| 20261019T081502Z-abcd | 2026-10-19 |"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| legacy:mistralrs-grammar-think | — |"),
+            "{md}"
+        );
+        assert!(md.contains("(legacy:mistralrs-grammar-think)**"), "{md}");
+    }
+
+    #[test]
+    fn the_printed_edge_point_lies_in_its_bracket() {
+        // The challenger also answered a scenario the baseline never saw:
+        // the overall difference differs from the shared-scenario one.
+        let base = grid("base", 40, 10, 1000, &never, &|_, rn| rn == 0);
+        let mut chal = grid("chal", 40, 10, 1000, &never, &never);
+        // 20 extra replies, half wrong: overall choice +7.6, shared +10.0.
+        chal.extend(
+            grid("chal", 1, 20, 1000, &never, &|_, rn| rn < 10)
+                .into_iter()
+                .map(|mut l| {
+                    if let Line::Reply(r) = &mut l {
+                        r.scenario = "extra".into();
+                    }
+                    l
+                }),
+        );
+        let a = assess(
+            &aggregate(&[base, chal].concat()),
+            &cfg(),
+            &RunSelection::default(),
+        );
+        match &a.verdict {
+            Verdict::Build(r) => assert!(
+                r.iter()
+                    .any(|x| x.contains("on correct choice by +10.0 pts [10.0–10.0] (clearly)")),
+                "{r:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1318,7 +1421,9 @@ mod tests {
         match &a.verdict {
             Verdict::Build(r) => assert!(
                 r.iter()
-                    .any(|x| x.contains("on correct choice by +10.0 pts [10.0–10.0], clearly")),
+                    .any(|x| x.contains(
+                    "on correct choice by +10.0 pts [10.0–10.0] (clearly), at comparable median speed"
+                )),
                 "{r:?}"
             ),
             other => panic!("{other:?}"),

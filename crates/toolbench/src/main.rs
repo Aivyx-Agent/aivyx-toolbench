@@ -80,6 +80,17 @@ fn parse_pick(s: &str) -> Result<(String, String), String> {
         .ok_or_else(|| format!("expected NAME=RUN_ID, got `{s}`"))
 }
 
+/// `--run` picks as a selection; naming one endpoint twice is an error.
+fn selection(picks: Vec<(String, String)>, latest: bool) -> Result<report::RunSelection> {
+    let mut map = std::collections::BTreeMap::new();
+    for (name, id) in picks {
+        if let Some(prev) = map.insert(name.clone(), id) {
+            anyhow::bail!("--run {name} given twice (already `{prev}`)");
+        }
+    }
+    Ok(report::RunSelection { picks: map, latest })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
@@ -176,10 +187,7 @@ async fn main() -> Result<()> {
                 lines.extend(result::read_lines_tagged(path)?);
             }
             let stats = report::aggregate(&lines);
-            let sel = report::RunSelection {
-                picks: picks.into_iter().collect(),
-                latest,
-            };
+            let sel = selection(picks, latest)?;
             let assessment = cfg
                 .verdict
                 .as_ref()
@@ -205,4 +213,24 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_run_pick_is_rejected() {
+        let picks = vec![
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ];
+        assert_eq!(selection(picks, false).unwrap().picks.len(), 2);
+        let dup = vec![
+            ("a".to_string(), "1".to_string()),
+            ("a".to_string(), "2".to_string()),
+        ];
+        let err = selection(dup, false).unwrap_err().to_string();
+        assert!(err.contains("--run a"), "{err}");
+    }
 }
