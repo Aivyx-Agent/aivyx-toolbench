@@ -3,6 +3,8 @@
 [![CI](https://github.com/Aivyx-Agent/aivyx-toolbench/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Aivyx-Agent/aivyx-toolbench/actions/workflows/ci.yml)
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 
+Part of the [Aivyx Ecosystem](https://aivyx-ecosystem.com/building-blocks/): a shared building block of [Aivyx PA](https://aivyx-ecosystem.com/pa/) and [aivyx-coder](https://aivyx-ecosystem.com/coder/).
+
 Measures how reliably a local model server produces valid tool calls for
 Aivyx PA's and aivyx-coder's real tool lists.
 
